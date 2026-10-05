@@ -11,9 +11,10 @@ pub use instance::{
     ActivityState, ActivityUpdate, HerdrContext, InstanceRecord, InstanceState, StopMode,
 };
 pub use launch::{
-    BindAccess, BindMount, BindMountSource, EnvironmentVariable, ForegroundCommand, LaunchHandoff,
-    LaunchRequest, LaunchSpec, LauncherContinuation, NetworkMode, PrepareLaunchRequest,
-    PreparedExec, PreparedLaunch, ResourceLimits, RuntimeDataFile, RuntimeKind, RuntimePolicy,
+    BindAccess, BindMount, BindMountSource, DeviceMount, EnvironmentVariable, ForegroundCommand,
+    LaunchHandoff, LaunchRequest, LaunchSpec, LauncherContinuation, NetworkMode,
+    PrepareLaunchRequest, PreparedExec, PreparedLaunch, ResourceLimits, RuntimeDataFile,
+    RuntimeKind, RuntimePolicy,
 };
 pub use service::{ServiceAction, ServiceConfiguration, ServiceResult};
 pub use workspace::{

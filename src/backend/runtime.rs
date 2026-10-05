@@ -5,12 +5,13 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt::{self, Display, Formatter};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 use tracing::debug;
 
 use crate::model::{
-    BindAccess, BindMountSource, LaunchSpec, NetworkMode, PreparedExec, RuntimeDataFile,
-    RuntimeKind,
+    BindAccess, BindMountSource, DeviceMount, LaunchSpec, NetworkMode, PreparedExec,
+    RuntimeDataFile, RuntimeKind,
 };
 
 pub const BUBBLEWRAP_EXECUTABLE: &str = "/usr/bin/bwrap";
@@ -42,6 +43,9 @@ impl RuntimeBackend for NativeRuntimeBackend {
                 expected: RuntimeKind::Native,
                 actual: launch.runtime.kind,
             });
+        }
+        if !launch.runtime.devices.is_empty() {
+            return Err(RuntimeError::NativeDevicesUnsupported);
         }
         debug!(
             executable = %launch.command.executable.display(),
@@ -101,6 +105,7 @@ impl BubblewrapRuntimeBackend {
         }
 
         let (mut mounts, sandbox_working_directory) = resolved_mounts(launch)?;
+        validate_devices(&launch.runtime.devices)?;
         mounts.sort_by(|left, right| {
             left.destination
                 .components()
@@ -109,7 +114,8 @@ impl BubblewrapRuntimeBackend {
                 .then_with(|| left.destination.cmp(&right.destination))
         });
 
-        let mut arguments = Vec::with_capacity(48 + mounts.len() * 3);
+        let mut arguments =
+            Vec::with_capacity(48 + mounts.len() * 3 + launch.runtime.devices.len() * 3);
         arguments.extend(
             [
                 "--unshare-user",
@@ -134,6 +140,7 @@ impl BubblewrapRuntimeBackend {
         push_pair(&mut arguments, "--proc", "/proc");
         push_pair(&mut arguments, "--dev", "/dev");
         push_pair(&mut arguments, "--tmpfs", "/dev/shm");
+        Self::append_devices(&mut arguments, &launch.runtime.devices);
         push_pair(&mut arguments, "--tmpfs", "/tmp");
         push_pair(&mut arguments, "--tmpfs", "/var/tmp");
         push_pair(&mut arguments, "--tmpfs", "/run");
@@ -173,6 +180,29 @@ impl BubblewrapRuntimeBackend {
             arguments,
             working_directory: launch.workspace.path.clone(),
         })
+    }
+
+    fn append_devices(arguments: &mut Vec<OsString>, devices: &[DeviceMount]) {
+        if devices.is_empty() {
+            return;
+        }
+        // Match Flatpak's read-only device topology, plus module metadata
+        // required by NVML. Keep unrelated kernel/firmware sysfs hidden.
+        for path in [
+            "/sys/block",
+            "/sys/bus",
+            "/sys/class",
+            "/sys/dev",
+            "/sys/devices",
+            "/sys/module",
+        ] {
+            push_triplet(arguments, "--ro-bind-try", path, path);
+        }
+        for device in devices {
+            arguments.push(OsString::from("--dev-bind"));
+            arguments.push(device.source.as_os_str().to_owned());
+            arguments.push(device.destination.as_os_str().to_owned());
+        }
     }
 
     fn append_environment(arguments: &mut Vec<OsString>, launch: &LaunchSpec, home: &Path) {
@@ -259,6 +289,15 @@ fn resolved_mounts(launch: &LaunchSpec) -> Result<(Vec<ResolvedBindMount>, PathB
             access: launch.support_mount_access,
         });
     }
+    if !launch.runtime.devices.is_empty()
+        && let Some(mount) = mounts
+            .iter()
+            .find(|mount| mount.destination.starts_with("/sys"))
+    {
+        return Err(RuntimeError::ProtectedDestination(
+            mount.destination.clone(),
+        ));
+    }
     let working_directory = workspace_destination.ok_or(RuntimeError::MissingWorkspaceMount)?;
     debug!(
         mount_count = mounts.len(),
@@ -266,6 +305,66 @@ fn resolved_mounts(launch: &LaunchSpec) -> Result<(Vec<ResolvedBindMount>, PathB
         "runtime mounts resolved"
     );
     Ok((mounts, working_directory))
+}
+
+fn validate_devices(devices: &[DeviceMount]) -> Result<(), RuntimeError> {
+    let mut destinations = HashSet::with_capacity(devices.len());
+    for device in devices {
+        let source = &device.source;
+        let destination = &device.destination;
+        if !normalized_device_path(source) {
+            return Err(RuntimeError::InvalidDeviceSource(source.clone()));
+        }
+        let canonical =
+            std::fs::canonicalize(source).map_err(|error| RuntimeError::DeviceSourceIo {
+                path: source.clone(),
+                message: error.to_string(),
+            })?;
+        if canonical.as_os_str() != source.as_os_str() {
+            return Err(RuntimeError::InvalidDeviceSource(source.clone()));
+        }
+        let file_type = std::fs::metadata(source)
+            .map_err(|error| RuntimeError::DeviceSourceIo {
+                path: source.clone(),
+                message: error.to_string(),
+            })?
+            .file_type();
+        if !file_type.is_char_device() && !file_type.is_block_device() {
+            return Err(RuntimeError::InvalidDeviceSource(source.clone()));
+        }
+        if !normalized_device_path(destination) {
+            return Err(RuntimeError::InvalidDestination(destination.clone()));
+        }
+        if [
+            "/dev/shm",
+            "/dev/pts",
+            "/dev/ptmx",
+            "/dev/fd",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/core",
+        ]
+        .iter()
+        .any(|protected| destination.starts_with(protected))
+        {
+            return Err(RuntimeError::ProtectedDestination(destination.clone()));
+        }
+        if !destinations.insert(destination) {
+            return Err(RuntimeError::DuplicateDestination(destination.clone()));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_device_path(path: &Path) -> bool {
+    path.is_absolute()
+        && path != Path::new("/dev")
+        && path.starts_with("/dev")
+        && !path.as_os_str().as_bytes().contains(&0)
+        && path.as_os_str().as_bytes()[1..]
+            .split(|byte| *byte == b'/')
+            .all(|component| !component.is_empty() && component != b"." && component != b"..")
 }
 
 fn validate_runtime_mount(source: &Path, destination: &Path) -> Result<(), RuntimeError> {
@@ -323,11 +422,30 @@ pub enum RuntimeError {
     ProtectedDestination(PathBuf),
     InvalidDataDescriptor,
     DuplicateDestination(PathBuf),
+    NativeDevicesUnsupported,
+    InvalidDeviceSource(PathBuf),
+    DeviceSourceIo {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl Display for RuntimeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NativeDevicesUnsupported => {
+                formatter.write_str("native runtime cannot restrict configured devices")
+            }
+            Self::InvalidDeviceSource(path) => write!(
+                formatter,
+                "device source must be a canonical character or block device beneath /dev: {}",
+                path.display()
+            ),
+            Self::DeviceSourceIo { path, message } => write!(
+                formatter,
+                "cannot inspect runtime device {}: {message}",
+                path.display()
+            ),
             Self::WrongBackend { expected, actual } => {
                 write!(
                     formatter,
@@ -421,6 +539,7 @@ mod tests {
                     },
                 ],
                 environment: Vec::new(),
+                devices: Vec::new(),
                 home: Some(PathBuf::from("/home/user")),
             },
             command: ForegroundCommand {
@@ -586,6 +705,134 @@ mod tests {
         assert_eq!(
             mounts.last().expect("support mount").access,
             BindAccess::ReadWrite
+        );
+    }
+
+    fn device(source: &str, destination: &str) -> DeviceMount {
+        DeviceMount {
+            source: PathBuf::from(source),
+            destination: PathBuf::from(destination),
+        }
+    }
+
+    #[test]
+    fn device_destinations_must_be_normalized_and_beneath_dev() {
+        for destination in [
+            "/dev",
+            "/tmp/device",
+            "dev/device",
+            "/dev/../device",
+            "/dev/./device",
+            "/dev//device",
+            "/dev/device/",
+            "/dev/device\0",
+        ] {
+            let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+            launch.runtime.devices = vec![device("/dev/null", destination)];
+            assert_eq!(
+                BubblewrapRuntimeBackend.prepare(&launch),
+                Err(RuntimeError::InvalidDestination(PathBuf::from(destination))),
+                "{destination:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn devices_cannot_overlay_private_dev_directories_or_links() {
+        for destination in [
+            "/dev/shm",
+            "/dev/shm/device",
+            "/dev/pts",
+            "/dev/pts/1",
+            "/dev/ptmx",
+            "/dev/fd",
+            "/dev/fd/1",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/core",
+        ] {
+            let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+            launch.runtime.devices = vec![device("/dev/null", destination)];
+            assert_eq!(
+                BubblewrapRuntimeBackend.prepare(&launch),
+                Err(RuntimeError::ProtectedDestination(PathBuf::from(
+                    destination
+                ))),
+                "{destination}",
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_rejects_non_devices_and_noncanonical_sources() {
+        for source in [
+            "/dev",
+            "/dev/shm",
+            "/dev/fd/0",
+            "/dev/../dev/null",
+            "/etc/passwd",
+        ] {
+            let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+            launch.runtime.devices = vec![device(source, "/dev/test-device")];
+            assert_eq!(
+                BubblewrapRuntimeBackend.prepare(&launch),
+                Err(RuntimeError::InvalidDeviceSource(PathBuf::from(source))),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_device_source_is_an_error_not_an_omitted_grant() {
+        let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+        launch.runtime.devices = vec![device(
+            "/dev/runroom-nonexistent-regression-device",
+            "/dev/test-device",
+        )];
+        assert!(matches!(
+            BubblewrapRuntimeBackend.prepare(&launch),
+            Err(RuntimeError::DeviceSourceIo { .. }),
+        ));
+    }
+
+    #[test]
+    fn device_destinations_cannot_be_duplicated() {
+        let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+        launch.runtime.devices = vec![
+            device("/dev/null", "/dev/test-device"),
+            device("/dev/zero", "/dev/test-device"),
+        ];
+        assert_eq!(
+            BubblewrapRuntimeBackend.prepare(&launch),
+            Err(RuntimeError::DuplicateDestination(PathBuf::from(
+                "/dev/test-device"
+            ))),
+        );
+    }
+
+    #[test]
+    fn native_execution_rejects_device_policy() {
+        let mut launch = launch(RuntimeKind::Native, NetworkMode::Host);
+        launch.runtime.devices = vec![device("/dev/null", "/dev/test-device")];
+        assert_eq!(
+            NativeRuntimeBackend.prepare(&launch),
+            Err(RuntimeError::NativeDevicesUnsupported),
+        );
+    }
+
+    #[test]
+    fn ordinary_binds_cannot_override_read_only_driver_sysfs() {
+        let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::None);
+        launch.runtime.devices = vec![device("/dev/null", "/dev/test-device")];
+        launch.runtime.bind_mounts.push(BindMount {
+            source: BindMountSource::Host(PathBuf::from("/sys")),
+            destination: PathBuf::from("/sys"),
+            access: BindAccess::ReadWrite,
+        });
+        assert_eq!(
+            BubblewrapRuntimeBackend.prepare(&launch),
+            Err(RuntimeError::ProtectedDestination(PathBuf::from("/sys"))),
         );
     }
 }

@@ -106,6 +106,15 @@ pub struct BindMount {
     pub access: BindAccess,
 }
 
+/// One host character or block device explicitly exposed inside Bubblewrap.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceMount {
+    /// Canonical host device node beneath `/dev`.
+    pub source: PathBuf,
+    /// Selected absolute device path, retaining an explicitly requested alias.
+    pub destination: PathBuf,
+}
+
 /// One host environment value deliberately projected into the outer runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EnvironmentVariable {
@@ -119,6 +128,7 @@ pub struct RuntimePolicy {
     pub kind: RuntimeKind,
     pub network: NetworkMode,
     pub bind_mounts: Vec<BindMount>,
+    pub devices: Vec<DeviceMount>,
     pub environment: Vec<EnvironmentVariable>,
     pub home: Option<PathBuf>,
 }

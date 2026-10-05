@@ -1,0 +1,4 @@
+# Local builds target this machine's CPU; binaries are not portable to older CPUs.
+# RUSTFLAGS supplied by the caller override these repository defaults.
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3"]

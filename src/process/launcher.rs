@@ -655,6 +655,7 @@ mod tests {
             kind: RuntimeKind::Bubblewrap,
             network: crate::model::NetworkMode::Host,
             bind_mounts: Vec::new(),
+            devices: Vec::new(),
             environment: vec![
                 EnvironmentVariable {
                     name: "TERM".to_owned(),

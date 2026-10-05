@@ -8,12 +8,12 @@ use std::fmt::{self, Display, Formatter};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use runroom::model::{
-    BindAccess, BindMount, BindMountSource, EnvironmentVariable, ForegroundCommand, NetworkMode,
-    ResourceLimits, RuntimeKind, RuntimePolicy, WorkspaceName,
+    BindAccess, BindMount, BindMountSource, DeviceMount, EnvironmentVariable, ForegroundCommand,
+    NetworkMode, ResourceLimits, RuntimeKind, RuntimePolicy, WorkspaceName,
 };
 use serde::Deserialize;
 use tracing::debug;
@@ -144,6 +144,8 @@ pub struct ProfileFileConfig {
     pub set_environment: BTreeMap<String, String>,
     #[serde(default)]
     pub bind_mounts: Vec<BindMountFileConfig>,
+    #[serde(default)]
+    pub devices: Vec<DeviceFileConfig>,
     pub memory_max_bytes: Option<u64>,
     pub tasks_max: Option<u64>,
     pub cpu_quota_basis_points: Option<u32>,
@@ -182,6 +184,44 @@ pub struct BindMountFileConfig {
     pub access: BindAccessFileMode,
     #[serde(default = "required_by_default")]
     pub required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "RawDeviceFileConfig")]
+pub struct DeviceFileConfig {
+    pub selector: DeviceSelector,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeviceSelector {
+    Path(PathBuf),
+    Class(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeviceFileConfig {
+    path: Option<PathBuf>,
+    class: Option<String>,
+    #[serde(default = "required_by_default")]
+    required: bool,
+}
+
+impl TryFrom<RawDeviceFileConfig> for DeviceFileConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawDeviceFileConfig) -> Result<Self, Self::Error> {
+        let selector = match (raw.path, raw.class) {
+            (Some(path), None) => DeviceSelector::Path(path),
+            (None, Some(class)) => DeviceSelector::Class(class),
+            _ => return Err("device entry requires exactly one of path or class"),
+        };
+        Ok(Self {
+            selector,
+            required: raw.required,
+        })
+    }
 }
 
 const fn required_by_default() -> bool {
@@ -278,6 +318,7 @@ impl LauncherSettings {
             Into::into,
         );
         let bind_mounts = resolve_bind_mounts(profile_config, kind)?;
+        let devices = resolve_devices(profile_config, kind)?;
         let environment = resolve_environment(profile_config)?;
         let project_environment = profile_config.project_environment.unwrap_or(false);
         let limits = ResourceLimits {
@@ -313,6 +354,7 @@ impl LauncherSettings {
             executable = %command.executable.display(),
             argument_count = command.arguments.len(),
             bind_mount_count = bind_mounts.len(),
+            device_count = devices.len(),
             environment_count = environment.len(),
             project_environment,
             "resolved launcher settings"
@@ -326,6 +368,7 @@ impl LauncherSettings {
                 kind,
                 network,
                 bind_mounts,
+                devices,
                 environment,
                 home,
             },
@@ -555,6 +598,259 @@ fn resolve_bind_mounts(
         }
     }
     Ok(mounts)
+}
+
+fn resolve_devices(
+    profile: &ProfileFileConfig,
+    runtime: RuntimeKind,
+) -> Result<Vec<DeviceMount>, SettingsError> {
+    if runtime != RuntimeKind::Bubblewrap && !profile.devices.is_empty() {
+        return Err(SettingsError::DevicesRequireBubblewrap);
+    }
+    resolve_devices_at(&profile.devices, Path::new("/dev"), Path::new("/sys/class"))
+}
+
+// Explicit discovery roots let tests exercise sysfs and NVIDIA discovery
+// without GPU hardware. Canonical sources must still be real /dev nodes.
+fn resolve_devices_at(
+    configured: &[DeviceFileConfig],
+    dev_root: &Path,
+    class_root: &Path,
+) -> Result<Vec<DeviceMount>, SettingsError> {
+    let mut mounts = BTreeMap::new();
+    for entry in configured {
+        match &entry.selector {
+            DeviceSelector::Path(path) => {
+                validate_device_path(path)?;
+                let relative = path.strip_prefix("/dev").expect("validated device path");
+                if let Some(mount) =
+                    resolve_device_node(&dev_root.join(relative), path, entry.required, false)?
+                {
+                    mounts.insert(mount.destination, mount.source);
+                }
+            }
+            DeviceSelector::Class(class) => {
+                validate_device_class(class)?;
+                let candidates = if class == "nvidia" {
+                    discover_nvidia_devices(dev_root, entry.required)?
+                } else {
+                    discover_class_devices(&class_root.join(class), entry.required)?
+                };
+                let mut found = false;
+                for destination in candidates {
+                    validate_device_path(&destination)?;
+                    let relative = destination
+                        .strip_prefix("/dev")
+                        .expect("validated device path");
+                    if let Some(mount) = resolve_device_node(
+                        &dev_root.join(relative),
+                        &destination,
+                        entry.required,
+                        true,
+                    )? {
+                        found = true;
+                        mounts.insert(mount.destination, mount.source);
+                    }
+                }
+                if entry.required && !found {
+                    return Err(SettingsError::MissingDeviceClass(class.clone()));
+                }
+            }
+        }
+    }
+    Ok(mounts
+        .into_iter()
+        .map(|(destination, source)| DeviceMount {
+            source,
+            destination,
+        })
+        .collect())
+}
+
+fn validate_device_path(path: &Path) -> Result<(), SettingsError> {
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(SettingsError::InvalidDevicePath(path.to_owned()));
+            }
+        }
+    }
+    if !path.is_absolute()
+        || path.as_os_str().as_bytes().contains(&0)
+        || normalized.as_os_str() != path.as_os_str()
+        || path == Path::new("/dev")
+        || !path.starts_with("/dev")
+        || [
+            "/dev/shm",
+            "/dev/pts",
+            "/dev/ptmx",
+            "/dev/fd",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/core",
+        ]
+        .iter()
+        .any(|protected| path.starts_with(protected))
+    {
+        return Err(SettingsError::InvalidDevicePath(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_device_class(class: &str) -> Result<(), SettingsError> {
+    if class.is_empty()
+        || class == "."
+        || class == ".."
+        || class
+            .as_bytes()
+            .iter()
+            .any(|byte| *byte == b'/' || *byte == 0)
+    {
+        return Err(SettingsError::InvalidDeviceClass(class.to_owned()));
+    }
+    Ok(())
+}
+
+fn device_io(path: &Path, source: io::Error) -> SettingsError {
+    SettingsError::DeviceIo {
+        path: path.to_owned(),
+        source,
+    }
+}
+
+fn resolve_device_node(
+    path: &Path,
+    destination: &Path,
+    required: bool,
+    class_member: bool,
+) -> Result<Option<DeviceMount>, SettingsError> {
+    let source = match fs::canonicalize(path) {
+        Ok(source) => source,
+        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(device_io(path, error)),
+    };
+    let metadata = match fs::metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if !required && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(device_io(&source, error)),
+    };
+    if !metadata.file_type().is_char_device() && !metadata.file_type().is_block_device() {
+        return if class_member {
+            Ok(None)
+        } else {
+            Err(SettingsError::DeviceNotNode(source))
+        };
+    }
+    if source == Path::new("/dev") || !source.starts_with("/dev") {
+        return Err(SettingsError::InvalidDevicePath(source));
+    }
+    Ok(Some(DeviceMount {
+        source,
+        destination: destination.to_owned(),
+    }))
+}
+
+fn device_directory(path: &Path, required: bool) -> Result<Option<fs::ReadDir>, SettingsError> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => Ok(None),
+        Err(error) => Err(device_io(path, error)),
+    }
+}
+
+fn discover_nvidia_devices(dev_root: &Path, required: bool) -> Result<Vec<PathBuf>, SettingsError> {
+    let mut candidates = Vec::new();
+    let Some(entries) = device_directory(dev_root, required)? else {
+        return Ok(candidates);
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| device_io(dev_root, error))?;
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        let gpu = bytes
+            .strip_prefix(b"nvidia")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit));
+        if gpu
+            || matches!(
+                bytes,
+                b"nvidiactl" | b"nvidia-modeset" | b"nvidia-uvm" | b"nvidia-uvm-tools"
+            )
+        {
+            candidates.push(Path::new("/dev").join(name));
+        }
+    }
+    let caps = dev_root.join("nvidia-caps");
+    // Capability nodes and individual driver components are not installed by
+    // every driver; only the selected class as a whole must be present.
+    if let Some(entries) = device_directory(&caps, false)? {
+        for entry in entries {
+            let entry = entry.map_err(|error| device_io(&caps, error))?;
+            candidates.push(Path::new("/dev/nvidia-caps").join(entry.file_name()));
+        }
+    }
+    Ok(candidates)
+}
+
+fn discover_class_devices(
+    class_path: &Path,
+    required: bool,
+) -> Result<Vec<PathBuf>, SettingsError> {
+    let mut candidates = Vec::new();
+    let Some(entries) = device_directory(class_path, false)? else {
+        return Ok(candidates);
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| device_io(class_path, error))?;
+        let path = entry.path();
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if !required && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(device_io(&path, error)),
+        };
+        if metadata.is_dir() {
+            collect_class_devices(&path, &mut candidates)?;
+        }
+    }
+    Ok(candidates)
+}
+
+fn collect_class_devices(
+    member: &Path,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<(), SettingsError> {
+    let uevent = member.join("uevent");
+    match fs::read_to_string(&uevent) {
+        Ok(contents) => {
+            for name in contents
+                .lines()
+                .filter_map(|line| line.strip_prefix("DEVNAME="))
+            {
+                if Path::new(name).is_absolute() || name.is_empty() {
+                    return Err(SettingsError::InvalidDevicePath(PathBuf::from(name)));
+                }
+                candidates.push(Path::new("/dev").join(name));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(device_io(&uevent, error)),
+    }
+    for entry in fs::read_dir(member).map_err(|error| device_io(member, error))? {
+        let entry = entry.map_err(|error| device_io(member, error))?;
+        // Follow membership symlinks once, above, but not sysfs device/subsystem
+        // links back into the tree. Nested input/event nodes are real directories.
+        if entry
+            .file_type()
+            .map_err(|error| device_io(&entry.path(), error))?
+            .is_dir()
+        {
+            collect_class_devices(&entry.path(), candidates)?;
+        }
+    }
+    Ok(())
 }
 
 fn expand_host_path(source: &str) -> Result<PathBuf, SettingsError> {
@@ -800,6 +1096,12 @@ pub enum SettingsError {
     InvalidBindDestination(PathBuf),
     ProtectedBindDestination(PathBuf),
     DuplicateBindDestination(PathBuf),
+    DevicesRequireBubblewrap,
+    InvalidDevicePath(PathBuf),
+    InvalidDeviceClass(String),
+    DeviceNotNode(PathBuf),
+    MissingDeviceClass(String),
+    DeviceIo { path: PathBuf, source: io::Error },
     OptionalWorkspaceMount,
     MissingWorkspaceMount,
     DuplicateWorkspaceMount,
@@ -812,6 +1114,8 @@ pub enum SettingsError {
 }
 
 impl Display for SettingsError {
+    // Keep user-facing messages in one exhaustive match over configuration errors.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::DefaultSocket(source) => source.fmt(formatter),
@@ -882,6 +1186,32 @@ impl Display for SettingsError {
             Self::DuplicateBindDestination(path) => {
                 write!(formatter, "duplicate bind destination: {}", path.display())
             }
+            Self::DevicesRequireBubblewrap => formatter.write_str(
+                "device configuration requires Bubblewrap; native execution cannot confine devices",
+            ),
+            Self::InvalidDevicePath(path) => write!(
+                formatter,
+                "device path must be a normalized node beneath /dev outside runtime-managed paths: {}",
+                path.display()
+            ),
+            Self::InvalidDeviceClass(class) => write!(
+                formatter,
+                "device class must be one /sys/class component: {class}"
+            ),
+            Self::DeviceNotNode(path) => write!(
+                formatter,
+                "device source is not a character or block device: {}",
+                path.display()
+            ),
+            Self::MissingDeviceClass(class) => write!(
+                formatter,
+                "required device class has no available device nodes: {class}"
+            ),
+            Self::DeviceIo { path, source } => write!(
+                formatter,
+                "cannot resolve device path {}: {source}",
+                path.display()
+            ),
             Self::OptionalWorkspaceMount => formatter.write_str("@workspace bind cannot be optional"),
             Self::MissingWorkspaceMount => {
                 formatter.write_str("bubblewrap profile requires one @workspace bind")
@@ -940,7 +1270,9 @@ fn fmt_resource_limits(formatter: &mut Formatter<'_>, context: &str) -> fmt::Res
 impl Error for SettingsError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::DefaultSocket(source) | Self::InvalidBindSource { source, .. } => Some(source),
+            Self::DefaultSocket(source)
+            | Self::InvalidBindSource { source, .. }
+            | Self::DeviceIo { source, .. } => Some(source),
             Self::InvalidCommand { source } => Some(source),
             Self::BubblewrapUnavailable(source) | Self::TerminalPolicyUnavailable(source) => {
                 Some(source)
@@ -964,6 +1296,11 @@ impl Error for SettingsError {
             | Self::InvalidBindDestination(_)
             | Self::ProtectedBindDestination(_)
             | Self::DuplicateBindDestination(_)
+            | Self::DevicesRequireBubblewrap
+            | Self::InvalidDevicePath(_)
+            | Self::InvalidDeviceClass(_)
+            | Self::DeviceNotNode(_)
+            | Self::MissingDeviceClass(_)
             | Self::OptionalWorkspaceMount
             | Self::MissingWorkspaceMount
             | Self::DuplicateWorkspaceMount
@@ -981,6 +1318,8 @@ impl Error for SettingsError {
 mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
     fn profile(command: Option<&str>) -> ProfileFileConfig {
@@ -992,12 +1331,365 @@ mod tests {
             environment: Vec::new(),
             set_environment: BTreeMap::new(),
             bind_mounts: Vec::new(),
+            devices: Vec::new(),
             memory_max_bytes: None,
             tasks_max: None,
             cpu_quota_basis_points: None,
             cpu_cores: None,
             cpu_count: None,
         }
+    }
+
+    struct DeviceFixture {
+        root: PathBuf,
+        dev: PathBuf,
+        classes: PathBuf,
+    }
+
+    impl DeviceFixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = env::temp_dir().join(format!(
+                "runroom-config-devices-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).expect("create unique device fixture");
+            let dev = root.join("dev");
+            let classes = root.join("sys/class");
+            fs::create_dir(&dev).expect("create fixture dev");
+            fs::create_dir_all(&classes).expect("create fixture classes");
+            Self { root, dev, classes }
+        }
+
+        fn node(&self, name: &str, source: &str) {
+            let path = self.dev.join(name);
+            fs::create_dir_all(path.parent().expect("node parent")).expect("create node parent");
+            symlink(source, path).expect("alias baseline host device");
+        }
+
+        fn uevent(&self, member: &str, contents: &str) {
+            let path = self.classes.join(member);
+            fs::create_dir_all(&path).expect("create fixture class member");
+            fs::write(path.join("uevent"), contents).expect("write fixture uevent");
+        }
+
+        fn resolve(&self, entries: &[DeviceFileConfig]) -> Result<Vec<DeviceMount>, SettingsError> {
+            resolve_devices_at(entries, &self.dev, &self.classes)
+        }
+    }
+
+    impl Drop for DeviceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn device_path(path: &str, required: bool) -> DeviceFileConfig {
+        DeviceFileConfig {
+            selector: DeviceSelector::Path(PathBuf::from(path)),
+            required,
+        }
+    }
+
+    fn device_class(class: &str, required: bool) -> DeviceFileConfig {
+        DeviceFileConfig {
+            selector: DeviceSelector::Class(class.to_owned()),
+            required,
+        }
+    }
+
+    #[test]
+    fn device_entries_require_one_selector_and_default_to_required() {
+        let parsed: ProfileFileConfig = toml::from_str(
+            r#"devices = [{ path = "/dev/ttyUSB0" }, { class = "drm", required = false }]"#,
+        )
+        .expect("parse device selectors");
+        assert_eq!(
+            parsed.devices,
+            [
+                device_path("/dev/ttyUSB0", true),
+                device_class("drm", false),
+            ]
+        );
+        for entries in [
+            "[{}]",
+            "[{ required = false }]",
+            r#"[{ path = "/dev/null", class = "drm" }]"#,
+            r#"[{ path = "/dev/null", access = "ro" }]"#,
+            r#"[{ class = "drm", required = "no" }]"#,
+        ] {
+            assert!(
+                toml::from_str::<ProfileFileConfig>(&format!("devices = {entries}")).is_err(),
+                "{entries}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_aliases_preserve_destinations_and_canonicalize_sources() {
+        let fixture = DeviceFixture::new();
+        fixture.node("serial/by-id/controller", "/dev/null");
+        fixture.node("null", "/dev/null");
+        let mounts = fixture
+            .resolve(&[
+                device_path("/dev/serial/by-id/controller", true),
+                device_path("/dev/null", true),
+                device_path("/dev/serial/by-id/controller", true),
+            ])
+            .expect("resolve node aliases");
+        assert_eq!(
+            mounts,
+            [
+                DeviceMount {
+                    source: PathBuf::from("/dev/null"),
+                    destination: PathBuf::from("/dev/null"),
+                },
+                DeviceMount {
+                    source: PathBuf::from("/dev/null"),
+                    destination: PathBuf::from("/dev/serial/by-id/controller"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_classes_follow_membership_and_include_nested_nodes_without_cycles() {
+        let fixture = DeviceFixture::new();
+        fixture.node("input/input7", "/dev/null");
+        fixture.node("input/event7", "/dev/zero");
+        fixture.uevent("input/input7", "DEVNAME=input/input7\n");
+        fixture.uevent("input/input7/event7", "DEVNAME=input/event7\n");
+        fixture.uevent("input/no-node", "SUBSYSTEM=input\n");
+        symlink(
+            &fixture.classes,
+            fixture.classes.join("input/input7/subsystem"),
+        )
+        .expect("create sysfs backlink");
+        let target = fixture.root.join("sys/devices/render");
+        fs::create_dir_all(&target).expect("create sysfs membership target");
+        fs::write(target.join("uevent"), "DEVNAME=input/event7\n").expect("write target uevent");
+        fs::create_dir(fixture.classes.join("drm")).expect("create drm class");
+        symlink(target, fixture.classes.join("drm/renderD128")).expect("create class membership");
+
+        let mounts = fixture
+            .resolve(&[
+                device_class("input", true),
+                device_class("drm", true),
+                device_path("/dev/input/event7", true),
+            ])
+            .expect("resolve nested classes and overlapping node");
+        assert_eq!(
+            mounts,
+            [
+                DeviceMount {
+                    source: PathBuf::from("/dev/zero"),
+                    destination: PathBuf::from("/dev/input/event7"),
+                },
+                DeviceMount {
+                    source: PathBuf::from("/dev/null"),
+                    destination: PathBuf::from("/dev/input/input7"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn nvidia_class_exposes_only_driver_nodes_and_capability_nodes() {
+        let fixture = DeviceFixture::new();
+        let expected = [
+            "nvidia-caps/nvidia-cap1",
+            "nvidia-modeset",
+            "nvidia-uvm",
+            "nvidia-uvm-tools",
+            "nvidia0",
+            "nvidia12",
+            "nvidiactl",
+        ];
+        for name in expected {
+            fixture.node(name, "/dev/null");
+        }
+        for name in ["nvidia", "nvidia-debug", "nvidia1extra", "unrelated"] {
+            fixture.node(name, "/dev/zero");
+        }
+        fs::write(fixture.dev.join("nvidia9"), "not a device").expect("write non-node GPU file");
+        fs::write(fixture.dev.join("nvidia-caps/readme"), "not a device")
+            .expect("write non-node capability file");
+        fs::create_dir(fixture.dev.join("nvidia8")).expect("create non-node GPU directory");
+        let mounts = fixture
+            .resolve(&[
+                device_class("nvidia", true),
+                device_path("/dev/nvidia0", true),
+            ])
+            .expect("resolve NVIDIA device class without GPU hardware");
+        assert_eq!(mounts.len(), expected.len());
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|mount| mount.destination.clone())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|name| Path::new("/dev").join(name))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.source == Path::new("/dev/null"))
+        );
+    }
+
+    #[test]
+    fn missing_devices_and_classes_are_optional_only_when_requested() {
+        let fixture = DeviceFixture::new();
+        assert_eq!(
+            fixture
+                .resolve(&[device_path("/dev/missing", false)])
+                .unwrap(),
+            Vec::<DeviceMount>::new()
+        );
+        assert!(matches!(
+            fixture.resolve(&[device_path("/dev/missing", true)]),
+            Err(SettingsError::DeviceIo { source, .. }) if source.kind() == io::ErrorKind::NotFound
+        ));
+        for class in ["missing", "nvidia", "empty"] {
+            if class == "empty" {
+                fs::create_dir(fixture.classes.join(class)).expect("create empty class");
+            }
+            assert_eq!(
+                fixture.resolve(&[device_class(class, false)]).unwrap(),
+                Vec::<DeviceMount>::new()
+            );
+            assert!(matches!(
+                fixture.resolve(&[device_class(class, true)]),
+                Err(SettingsError::MissingDeviceClass(name)) if name == class
+            ));
+        }
+        fixture.uevent("input/event0", "DEVNAME=input/event0\n");
+        assert_eq!(
+            fixture.resolve(&[device_class("input", false)]).unwrap(),
+            Vec::<DeviceMount>::new()
+        );
+        assert!(matches!(
+            fixture.resolve(&[device_class("input", true)]),
+            Err(SettingsError::DeviceIo { source, .. }) if source.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn optional_devices_do_not_hide_wrong_types_or_unexpected_io_errors() {
+        let fixture = DeviceFixture::new();
+        fs::write(fixture.dev.join("regular"), "not a device").expect("create regular file");
+        fs::create_dir(fixture.dev.join("directory")).expect("create directory");
+        for name in ["regular", "directory"] {
+            assert!(matches!(
+                fixture.resolve(&[device_path(&format!("/dev/{name}"), false)]),
+                Err(SettingsError::DeviceNotNode(_))
+            ));
+        }
+        symlink("loop", fixture.dev.join("loop")).expect("create broken cyclic alias");
+        assert!(matches!(
+            fixture.resolve(&[device_path("/dev/loop", false)]),
+            Err(SettingsError::DeviceIo { source, .. }) if source.kind() != io::ErrorKind::NotFound
+        ));
+        fixture.uevent("drm/card0", "DEVNAME=card0\n");
+        fs::write(fixture.classes.join("drm/card0/uevent"), [0xff]).expect("write invalid uevent");
+        assert!(matches!(
+            fixture.resolve(&[device_class("drm", false)]),
+            Err(SettingsError::DeviceIo { source, .. }) if source.kind() == io::ErrorKind::InvalidData
+        ));
+        fs::write(fixture.classes.join("invalid"), "not a directory").expect("write invalid class");
+        assert!(matches!(
+            fixture.resolve(&[device_class("invalid", false)]),
+            Err(SettingsError::DeviceIo { .. })
+        ));
+    }
+
+    #[test]
+    fn optional_classes_preserve_permission_errors() {
+        if nix::unistd::Uid::effective().is_root() {
+            return; // Root bypasses filesystem mode permissions.
+        }
+        let fixture = DeviceFixture::new();
+        fixture.uevent("drm/card0", "DEVNAME=card0\n");
+        let path = fixture.classes.join("drm/card0/uevent");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o0))
+            .expect("make uevent unreadable");
+        assert!(matches!(
+            fixture.resolve(&[device_class("drm", false)]),
+            Err(SettingsError::DeviceIo { source, .. }) if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn rejects_unsafe_device_paths_classes_and_sysfs_devnames() {
+        for path in [
+            "dev/null",
+            "/dev",
+            "/dev/",
+            "/dev//null",
+            "/dev/./null",
+            "/dev/../etc/passwd",
+            "/dev/null/",
+            "/etc/passwd",
+            "/device/null",
+            "/dev/pts/0",
+            "/dev/shm/node",
+            "/dev/fd/0",
+            "/dev/ptmx",
+            "/dev/stdin",
+            "/dev/stdout",
+            "/dev/stderr",
+            "/dev/core",
+        ] {
+            assert!(
+                matches!(
+                    validate_device_path(Path::new(path)),
+                    Err(SettingsError::InvalidDevicePath(_))
+                ),
+                "{path}"
+            );
+        }
+        let nul = PathBuf::from(OsString::from_vec(b"/dev/nu\0ll".to_vec()));
+        assert!(matches!(
+            validate_device_path(&nul),
+            Err(SettingsError::InvalidDevicePath(_))
+        ));
+        for class in ["", ".", "..", "../drm", "drm/card0", "/drm", "drm\0"] {
+            assert!(
+                matches!(
+                    validate_device_class(class),
+                    Err(SettingsError::InvalidDeviceClass(_))
+                ),
+                "{class}"
+            );
+        }
+        let fixture = DeviceFixture::new();
+        for devname in ["/etc/passwd", "../etc/passwd", "pts/0", ""] {
+            fixture.uevent("drm/card0", &format!("DEVNAME={devname}\n"));
+            assert!(
+                matches!(
+                    fixture.resolve(&[device_class("drm", false)]),
+                    Err(SettingsError::InvalidDevicePath(_))
+                ),
+                "{devname}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_runtime_rejects_device_configuration_even_when_optional() {
+        let mut file = file_config();
+        file.launcher
+            .profiles
+            .get_mut("pi")
+            .expect("profile")
+            .devices = vec![device_class("nvidia", false)];
+        assert!(matches!(
+            LauncherSettings::resolve(None, None, None, None, false, &file),
+            Err(SettingsError::DevicesRequireBubblewrap)
+        ));
     }
 
     fn file_config() -> FileConfig {
@@ -1172,6 +1864,7 @@ verbose = false
                     required: true,
                 },
             ],
+            devices: Vec::new(),
             memory_max_bytes: None,
             tasks_max: None,
             cpu_quota_basis_points: None,
@@ -1362,6 +2055,7 @@ verbose = false
                 project_environment: None,
                 network: None,
                 bind_mounts: Vec::new(),
+                devices: Vec::new(),
                 memory_max_bytes: None,
                 tasks_max: None,
                 cpu_quota_basis_points: None,
@@ -1385,6 +2079,7 @@ verbose = false
                     access: BindAccessFileMode::Ro,
                     required: true,
                 }],
+                devices: Vec::new(),
                 memory_max_bytes: None,
                 tasks_max: None,
                 cpu_quota_basis_points: None,

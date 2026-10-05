@@ -23,6 +23,39 @@ command = "/usr/bin/node @HOME@/.local/lib/node_modules/@earendil-works/pi-codin
 project_environment = true
 identity = "herdr"
 network = "host"
+# Explicit device grants are Bubblewrap-only; native execution cannot confine
+# devices and rejects nonempty devices configuration. Every grant is a single
+# character/block node via --dev-bind, never the host /dev directory.
+# Select exactly one path or class per entry; required defaults to true:
+# devices = [{ path = "/dev/ttyUSB0" }, { class = "drm", required = false }]
+# Individual paths must be normalized absolute /dev nodes; symlink aliases are
+# retained inside the sandbox while their host sources are canonicalized.
+# Generic classes discover /sys/class/<class> uevent DEVNAME nodes, including
+# nested entries (e.g. input events). Overlapping grants are deduplicated.
+# Discovery happens at launch, not on hotplug; restart to discover new devices.
+# required = false allows absent nodes/classes, not permission or other IO errors.
+# Required missing nodes/classes fail launch. Classes grant ALL discovered nodes;
+# driver/device access expands the kernel attack surface and may grant hardware,
+# raw storage, input, or GPU access. Host ownership/permissions still apply.
+# Grants permit device operations, not just monitoring; there is no read-only
+# ioctl filter, GPU reservation, or Docker-style device-cgroup policy.
+# NVIDIA is deliberately always enabled for both shipped profiles, including
+# nvidia-smi: GPU indices, control/modeset/UVM nodes and nvidia-caps nodes only.
+# No NVIDIA driver nodes means launch fails; make the class optional explicitly
+# if absence is acceptable. Devices alone do not install/load the host driver.
+# For one NVIDIA GPU, explicit paths also need companion driver nodes (at least
+# /dev/nvidiactl for NVML; CUDA may need UVM). The nvidia class grants all GPUs.
+# nvidia-smi and its matching driver libraries must exist in the sandbox's /usr
+# (the existing read-only /usr projection supplies host files there). Device
+# grants also expose /sys/{block,bus,class,dev,devices,module} read-only for
+# NVML/sysfs discovery, revealing host hardware and module metadata without
+# exposing /sys/kernel, /sys/firmware or /sys/fs. Without driver files or the
+# required sysfs information, nvidia-smi may fail.
+# Related device-grant models (these are not Flatpak aliases or Docker CDI):
+# https://docs.flatpak.org/en/latest/sandbox-permissions.html
+# https://docs.docker.com/reference/cli/docker/container/run/#device
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+devices = [{ class = "nvidia" }]
 # CPU placement restricts this instance and every descendant through systemd AllowedCPUs.
 # Choose ONE: a count of logical CPUs or a nonempty, unique list of logical CPU IDs.
 # cpu_count selects the lowest available IDs; IDs must be available to the runtime leader.
@@ -87,6 +120,9 @@ command = "/opt/omp"
 project_environment = true
 identity = "herdr"
 network = "host"
+# Same explicit NVIDIA access, required-node behavior, /usr driver-file and
+# read-only sysfs dependencies, and security implications as the pi profile.
+devices = [{ class = "nvidia" }]
 environment = [
   "TERM",
   "COLORTERM",

@@ -148,6 +148,7 @@ mod tests {
                     kind: crate::model::RuntimeKind::Native,
                     network: crate::model::NetworkMode::Host,
                     bind_mounts: Vec::new(),
+                    devices: Vec::new(),
                     environment: Vec::new(),
                     home: None,
                 },
