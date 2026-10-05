@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+
+# Profiling / performance data
+/flamegraph.svg
+/perf.data
+/perf.data.old
+*.perf
+perf.data*
+
+# Editors / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

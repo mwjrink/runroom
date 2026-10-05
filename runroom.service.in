@@ -1,0 +1,17 @@
+[Unit]
+Description=Runroom per-user process broker
+Documentation=https://github.com/mwjrink/pidev
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=@RUNROOM_BINARY@ daemon
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=runroom
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+UMask=0077
+
+[Install]
+WantedBy=default.target

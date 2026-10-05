@@ -1,0 +1,137 @@
+# --here runs the exact current directory (including outside Git), not the project root,
+# and creates no Git worktree. It ignores launcher.name and conflicts with --name.
+# Default --here routing opens a new tab in the default Herdr session's active workspace.
+# That session must be running with an active workspace; there is no silent foreground fallback.
+# --no-multiplex runs in the current terminal without Herdr routing or identity,
+# with either --here or regular workspace selection.
+# The selected profile, command and resource limits still apply; -c overrides only command.
+# Bubblewrap --here replaces @workspace mappings with a writable /workspace bind.
+# Explicit host-source profile mounts remain permissions; native mode does not confine files.
+# Neither flag silently changes the configured runtime.
+# Examples: runroom --profile omp --here
+#           runroom --profile omp --here --no-multiplex
+# -c overrides only the command; it does not change the selected profile's mounts.
+runtime = "bubblewrap"
+socket = "/run/user/@UID@/runroom/control.sock"
+
+[launcher]
+profile = "pi"
+verbose = false
+
+[launcher.profiles.pi]
+command = "/usr/bin/node @HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+project_environment = true
+identity = "herdr"
+network = "host"
+# CPU placement restricts this instance and every descendant through systemd AllowedCPUs.
+# Choose ONE: a count of logical CPUs or a nonempty, unique list of logical CPU IDs.
+# cpu_count selects the lowest available IDs; IDs must be available to the runtime leader.
+# This is not a CPU-time quota or exclusive reservation: instances may share the same CPUs.
+# For two CPUs per instance (the same lowest pair can be used by every instance):
+# cpu_count = 2
+# Or for the same eight logical CPUs shared by every instance (if these IDs are available):
+# cpu_cores = [0, 1, 2, 3, 4, 5, 6, 7]
+# Valid counts: 1..1024. Valid IDs: 0..1023. CLI --cpu-count or --cpu-cores replaces both.
+# Requires cgroup v2 cpuset support/delegation; launch fails if EffectiveCPUs does not match.
+# Upgrade both the launcher binary and daemon together (control protocol 10).
+# Existing per-instance resource controls, independently combinable with CPU placement:
+# memory_max_bytes = 8589934592 # 8 GiB hard cgroup memory limit
+# tasks_max = 512 # Processes and threads combined
+# cpu_quota_basis_points = 20000 # Two CPUs' worth of time, not a placement restriction
+environment = [
+  "TERM",
+  "COLORTERM",
+  "HERDR_WORKSPACE_ID",
+  "HERDR_PANE_ID",
+  "RUNROOM_DATABASE_URL",
+  "RUNROOM_MODEL_CACHE_DIR",
+  "RUNROOM_POSTGRES_DB",
+  "RUNROOM_POSTGRES_PASSWORD",
+  "RUNROOM_POSTGRES_PORT",
+  "RUNROOM_POSTGRES_USER",
+  "RUNROOM_QDRANT_API_KEY",
+  "RUNROOM_QDRANT_COLLECTION",
+  "RUNROOM_QDRANT_GRPC_PORT",
+  "RUNROOM_QDRANT_HTTP_PORT",
+  "RUNROOM_QDRANT_URL",
+  "RUNROOM_STATE_DIR",
+  "RUNROOM_INITIAL_PROFILE",
+]
+set_environment = {
+  PATH = "@HOME@/.local/bin:/usr/local/bin:/usr/bin",
+  LANG = "C.UTF-8",
+  LC_ALL = "C.UTF-8",
+  HERDR_ENV = "1",
+  XDG_RUNTIME_DIR = "/run/user/@UID@",
+}
+bind_mounts = [
+  { source = "@workspace", destination = "/workspace", access = "rw" },
+  { source = "@HOME@/.pi/agent", destination = "@HOME@/.pi/agent", access = "rw" },
+  { source = "@HOME@/.pi/local-extensions", destination = "@HOME@/.pi/local-extensions", access = "ro" },
+  { source = "@HOME@/.agents/skills", destination = "@HOME@/.agents/skills", access = "ro" },
+  { source = "@HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent", destination = "@HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent", access = "ro" },
+  { source = "@RUNROOM_BINARY@", destination = "@HOME@/.local/bin/runroom", access = "ro" },
+  { source = "@HOME@/.local/bin/plannotator", destination = "@HOME@/.local/bin/plannotator", access = "ro" },
+  { source = "@HOME@/.local/state/runroom/workflow", destination = "@HOME@/.local/state/runroom/workflow", access = "rw" },
+  { source = "@HOME@/.cache/runroom", destination = "@HOME@/.cache/runroom", access = "rw" },
+  { source = "@HOME@/.local/share/plannotator", destination = "@HOME@/.local/share/plannotator", access = "rw" },
+  { source = "@HOME@/.gitconfig", destination = "@HOME@/.gitconfig", access = "ro" },
+  { source = "@HOME@/.config/git", destination = "@HOME@/.config/git", access = "ro" },
+  { source = "/run/user/@UID@/runroom/activity", destination = "/runtime/runroom", access = "ro" },
+]
+
+# Standalone OMP installation. /opt/omp is inside the sandbox, not a host install.
+# Its executable is read-only; only its agent state and the workspace are writable.
+[launcher.profiles.omp]
+command = "/opt/omp"
+project_environment = true
+identity = "herdr"
+network = "host"
+environment = [
+  "TERM",
+  "COLORTERM",
+  "HERDR_WORKSPACE_ID",
+  "HERDR_PANE_ID",
+  "RUNROOM_DATABASE_URL",
+  "RUNROOM_MODEL_CACHE_DIR",
+  "RUNROOM_POSTGRES_DB",
+  "RUNROOM_POSTGRES_PASSWORD",
+  "RUNROOM_POSTGRES_PORT",
+  "RUNROOM_POSTGRES_USER",
+  "RUNROOM_QDRANT_API_KEY",
+  "RUNROOM_QDRANT_COLLECTION",
+  "RUNROOM_QDRANT_GRPC_PORT",
+  "RUNROOM_QDRANT_HTTP_PORT",
+  "RUNROOM_QDRANT_URL",
+  "RUNROOM_STATE_DIR",
+]
+set_environment = {
+  PATH = "@HOME@/.local/bin:/usr/local/bin:/usr/bin:/opt",
+  LANG = "C.UTF-8",
+  LC_ALL = "C.UTF-8",
+}
+bind_mounts = [
+  { source = "@workspace", destination = "/workspace", access = "rw" },
+  { source = "@HOME@/.cache/.bun/bin/omp", destination = "/opt/omp", access = "ro" },
+  { source = "@HOME@/.omp/agent", destination = "@HOME@/.omp/agent", access = "rw" },
+  { source = "@HOME@/.agents/skills", destination = "@HOME@/.agents/skills", access = "ro" },
+  { source = "@RUNROOM_BINARY@", destination = "@HOME@/.local/bin/runroom", access = "ro" },
+  { source = "@HOME@/.gitconfig", destination = "@HOME@/.gitconfig", access = "ro" },
+  { source = "@HOME@/.config/git", destination = "@HOME@/.config/git", access = "ro" },
+  { source = "/run/user/@UID@/runroom/activity", destination = "/runtime/runroom", access = "ro" },
+]
+
+
+[daemon]
+state_file = "@HOME@/.local/state/runroom/instances.json"
+workspace_root = "@HOME@/.local/share/runroom/workspaces"
+verbose = false
+
+# The canonical state_file path defines the daemon's stable scope ownership.
+# Only one daemon may hold that registry, even when different sockets are used.
+# Existing recorded legacy scopes remain manageable; unrelated scopes are untouched.
+# Scalar ceilings also supply omitted per-launch limits. CPU placement is independent.
+# [daemon.resource_ceiling]
+# memory_max_bytes = 17179869184
+# tasks_max = 1024
+# cpu_quota_basis_points = 40000
