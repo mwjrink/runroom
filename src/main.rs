@@ -1,9 +1,12 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
+use std::io::{self, IsTerminal};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use runroom::model::{
     InstanceId, InstanceRecord, InstanceState, ServiceAction, ServiceConfiguration, ServiceResult,
     StopMode,
@@ -13,86 +16,28 @@ use tracing::debug;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 mod config;
+mod resume;
 
 use config::{
-    DaemonSettings, LauncherSettings, control_socket, load_default, load_path,
-    validate_all_profiles,
+    DaemonSettings, EffectiveLauncherConfig, ResolvedLauncherConfig, control_socket, load_default,
+    load_path, selected_config_path, validate_all_profiles,
 };
 
 use crate::config::FileConfig;
+use resume::confirm_config_policy;
 
-const AFTER_HELP: &str = r#"Configuration:
-  $XDG_CONFIG_HOME/runroom/config.toml
-  or $HOME/.config/runroom/config.toml
-
-Coordinator keys:
-  runtime = "bubblewrap"
-  socket = "/path/to/control.sock"
-
-Launcher profiles:
-  [launcher]
-  profile = "pi"
-  name = "default-workspace"
-  verbose = false
-
-  [launcher.profiles.pi]
-  command = "pi"
-  network = "host"
-  identity = "herdr"
-  memory_max_bytes = 8589934592
-  tasks_max = 512
-  cpu_quota_basis_points = 20000
-  cpu_count = 2
-  # Or select a shared set: cpu_cores = [0, 1, 2, 3, 4, 5, 6, 7]
-  environment = ["PATH", "TERM"]
-  bind_mounts = [
-    { source = "@workspace", destination = "/workspace", access = "rw" },
-  ]
-
-  [daemon]
-  workspace_root = "/path/to/durable/workspaces"
-  state_file = "/path/to/private/instances.json"
-  verbose = false
-
-  [daemon.resource_ceiling]
-  memory_max_bytes = 68719476736
-  tasks_max = 4096
-  cpu_quota_basis_points = 100000
-
---here executes in this shell/pane without creating or switching Herdr tabs.
-Inside Herdr it retains the current pane identity and activity reporting;
-outside Herdr it runs locally without Herdr reporting.
---no-worktree uses the exact current directory, not the Git project root, and also
-works outside Git. It creates no worktree, ignores the configured default workspace
-name, and conflicts with --name. Without --here it opens a tab in the default
-Herdr session. Combine --here --no-worktree to use this directory in this shell.
-Both flags also work after launcher. --no-multiplex has been removed.
-The configured command, profile and resource limits remain selected; -c overrides
-only the command. With Bubblewrap, --no-worktree exposes the directory read-write
-at /workspace, replacing @workspace mappings but retaining profile host mounts.
-Native mode does not confine files; neither flag changes the selected runtime.
-Upgrade the launcher and daemon together: their full application versions must match.
-
---ro/--read-only PATH grants read-only access at /BASENAME; relative sources resolve
-against the invoking host directory. -m/--mount SOURCE@DEST:ro|rw sets an explicit
-destination. Repeat flags for multiple mounts; duplicate destinations are errors.
-
-CPU placement uses either cpu_cores (nonempty unique logical CPU IDs, 0..1023)
-or cpu_count (1..1024), never both. IDs must be available to the runtime leader;
-a count selects its lowest available logical CPU IDs. systemd AllowedCPUs hard-restricts
-the instance and all descendants to that set, unlike cpu_quota_basis_points, which
-limits CPU time. Placement is shared, not an exclusive reservation: instances can
-use the same CPUs, including the same eight-core set or lowest two CPUs.
---cpu-cores 0,1 or --cpu-count 2 replaces both profile CPU selection values.
-Command-line values override configuration values for the selected mode and profile.
-Command strings use shell-style quoting to separate words, but are executed directly without a shell."#;
+fn configuration_help() -> String {
+    match selected_config_path() {
+        Some(path) => format!("Configuration: {}", path.display()),
+        None => "Configuration: none".to_owned(),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "runroom",
     version,
-    about = "Run a foreground program in a managed project workspace",
-    after_help = AFTER_HELP
+    about = "Run a foreground program in a managed project workspace"
 )]
 struct Cli {
     /// Launcher options used when no explicit mode is supplied.
@@ -103,11 +48,16 @@ struct Cli {
     role: Option<Role>,
 }
 
-#[derive(Debug, Args, Default)]
+#[derive(Clone, Debug, Args, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI switches plus an internal restore marker.
 struct LauncherArgs {
     /// Unix control socket used by the launcher.
     #[arg(long, value_name = "PATH")]
     socket: Option<PathBuf>,
+
+    /// Byte-preserving control socket used only by resolved replay arguments.
+    #[arg(long, hide = true, conflicts_with = "socket")]
+    socket_bytes: Option<String>,
 
     /// Named workspace to select instead of the primary workspace.
     #[arg(short = 'n', long, value_name = "NAME")]
@@ -125,6 +75,10 @@ struct LauncherArgs {
     #[arg(long, value_name = "PROFILE")]
     profile: Option<String>,
 
+    /// Frozen Herdr agent label carried by resolved launcher replay.
+    #[arg(long, hide = true, value_name = "LABEL")]
+    herdr_agent: Option<String>,
+
     /// Show detailed launcher lifecycle logs.
     #[arg(short, long, action = ArgAction::SetTrue)]
     verbose: bool,
@@ -132,6 +86,10 @@ struct LauncherArgs {
     /// Foreground command. Overrides the selected profile's command.
     #[arg(short, long, value_name = "COMMAND")]
     command: Option<String>,
+
+    /// Network policy for this launch, overriding the selected profile.
+    #[arg(long, value_enum, value_name = "host|none|private")]
+    network: Option<config::NetworkFileMode>,
 
     /// Logical CPU IDs allowed for the instance and all descendants, not a CPU-time quota.
     #[arg(
@@ -158,6 +116,18 @@ struct LauncherArgs {
     #[arg(long, value_name = "TOKEN", hide = true)]
     resume: Option<String>,
 
+    /// Internal durable launch argument payload.
+    #[arg(long, value_name = "HEX", hide = true)]
+    restore_args: Option<String>,
+
+    /// Declarative configuration fingerprint carried by launcher replay.
+    #[arg(long, hide = true, value_name = "HASH")]
+    config_hash: Option<String>,
+
+    /// Set only after decoding a durable restore payload.
+    #[arg(skip)]
+    restored: bool,
+
     /// Internal destination binding for a resumed launcher.
     #[arg(long, value_name = "TOKEN", hide = true)]
     continuation_token: Option<String>,
@@ -166,30 +136,42 @@ struct LauncherArgs {
 impl LauncherArgs {
     const fn is_empty(&self) -> bool {
         self.socket.is_none()
+            && self.socket_bytes.is_none()
             && self.name.is_none()
             && !self.no_worktree
             && !self.here
             && self.profile.is_none()
+            && self.herdr_agent.is_none()
             && !self.verbose
             && self.command.is_none()
             && self.cpu_cores.is_none()
+            && self.network.is_none()
             && self.cpu_count.is_none()
             && self.read_only.is_empty()
             && self.mounts.is_empty()
             && self.resume.is_none()
+            && self.restore_args.is_none()
+            && self.config_hash.is_none()
+            && !self.restored
             && self.continuation_token.is_none()
     }
 
     const fn has_only_verbose(&self) -> bool {
         self.socket.is_none()
+            && self.socket_bytes.is_none()
             && self.name.is_none()
             && !self.no_worktree
             && !self.here
             && self.profile.is_none()
+            && self.herdr_agent.is_none()
             && self.command.is_none()
             && self.cpu_cores.is_none()
+            && self.network.is_none()
             && self.cpu_count.is_none()
             && self.resume.is_none()
+            && self.restore_args.is_none()
+            && self.config_hash.is_none()
+            && !self.restored
             && self.read_only.is_empty()
             && self.mounts.is_empty()
             && self.continuation_token.is_none()
@@ -343,6 +325,7 @@ struct RootArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)] // Parsed once at startup; avoid an allocation per launch.
 enum Role {
     /// Connect to the daemon as the foreground launcher.
     Launcher(LauncherArgs),
@@ -368,7 +351,21 @@ enum Role {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayHelp {
+                // Only help needs the selected config path; never parse its contents here.
+                Cli::command()
+                    .after_help(configuration_help())
+                    .try_get_matches()
+                    .expect_err("the same help arguments still request help")
+                    .exit();
+            }
+            error.exit();
+        }
+    };
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("runroom: {error}");
@@ -378,6 +375,7 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    let cli = resolve_restore_cli(cli)?;
     match cli.role {
         Some(Role::AtomicWorker(args)) => {
             reject_implicit_launcher_options(&cli.launcher)?;
@@ -388,6 +386,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             reject_implicit_launcher_options(&cli.launcher)?;
             let file = load_path(&args.config)?;
             let profiles = validate_all_profiles(&file)?;
+            let current_directory = env::current_dir()?;
+            let profiles = profiles
+                .into_iter()
+                .map(|profile| profile.resolve(&current_directory))
+                .collect::<Result<Vec<_>, _>>()?;
             if !args.offline {
                 let socket = profiles
                     .first()
@@ -654,37 +657,224 @@ struct SelectedMode {
     verbose: bool,
 }
 
+// Herdr counts the executable, flag, and encoded payload toward its 8192-byte limit.
+const MAX_RESTORE_HEX_BYTES: usize = 8192 - "runroom".len() - "--restore-args".len();
+
+fn decode_hex(payload: &str) -> Result<Vec<u8>, &'static str> {
+    if payload.is_empty() || !payload.len().is_multiple_of(2) {
+        return Err("hexadecimal payload must be nonempty and have even length");
+    }
+    let nibble = |byte| match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err("payload must be lowercase hexadecimal"),
+    };
+    payload
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
+        .collect()
+}
+
+fn resolve_restore_cli(mut cli: Cli) -> Result<Cli, Box<dyn Error>> {
+    let payload = match &mut cli.role {
+        None => {
+            let payload = cli.launcher.restore_args.take();
+            if payload.is_some() && !cli.launcher.is_empty() {
+                return Err("--restore-args cannot be combined with launcher options".into());
+            }
+            payload
+        }
+        Some(Role::Launcher(args)) => {
+            let payload = args.restore_args.take();
+            if payload.is_some() && (!args.is_empty() || !cli.launcher.is_empty()) {
+                return Err("--restore-args cannot be combined with launcher options".into());
+            }
+            if cli.launcher.restore_args.is_some() {
+                return Err("--restore-args cannot precede an explicit role".into());
+            }
+            payload
+        }
+        Some(_) => {
+            if cli.launcher.restore_args.is_some() {
+                return Err("--restore-args is only valid for launching".into());
+            }
+            None
+        }
+    };
+    let Some(payload) = payload else {
+        return Ok(cli);
+    };
+    if payload.is_empty() || payload.len() > MAX_RESTORE_HEX_BYTES || payload.len() % 2 != 0 {
+        return Err("restore payload is empty or exceeds Herdr's 8192-byte argument limit".into());
+    }
+    let decoded = decode_hex(&payload)?;
+    let arguments: Vec<String> = serde_json::from_slice(&decoded)?;
+    if arguments.len() > 512
+        || arguments.iter().map(String::len).sum::<usize>() > 8192
+        || arguments.iter().any(|argument| argument.contains('\0'))
+    {
+        return Err("restore arguments exceed 512 arguments/8192 bytes or contain NUL".into());
+    }
+    let parsed = Cli::try_parse_from(std::iter::once("runroom".to_owned()).chain(arguments))?;
+    let mut launcher = match parsed.role {
+        None => parsed.launcher,
+        Some(Role::Launcher(args)) if parsed.launcher.is_empty() => args,
+        _ => {
+            return Err("restore payload must select the normal launcher, not another role".into());
+        }
+    };
+    if launcher.restore_args.is_some()
+        || launcher.resume.is_some()
+        || launcher.continuation_token.is_some()
+        || !launcher.here
+        || !launcher.no_worktree
+    {
+        return Err(
+            "restore payload requires --here --no-worktree and cannot recurse or resume a handoff"
+                .into(),
+        );
+    }
+    launcher.restored = true;
+    Ok(Cli {
+        launcher,
+        role: None,
+    })
+}
+
+fn canonical_replay_arguments(
+    settings: &ResolvedLauncherConfig,
+    config_hash: &str,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let (socket_flag, socket) = if let Some(socket) = settings.socket.to_str() {
+        ("--socket", socket.to_owned())
+    } else {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let socket = settings
+            .socket
+            .as_os_str()
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| {
+                [
+                    char::from(HEX[usize::from(byte >> 4)]),
+                    char::from(HEX[usize::from(byte & 15)]),
+                ]
+            })
+            .collect::<String>();
+        ("--socket-bytes", socket)
+    };
+    let network = match settings.runtime.network {
+        runroom::model::NetworkMode::Host => "host",
+        runroom::model::NetworkMode::None => "none",
+        runroom::model::NetworkMode::Private => "private",
+    };
+    let mut arguments = vec![
+        socket_flag.to_owned(),
+        socket,
+        "--profile".to_owned(),
+        settings.profile.clone(),
+        "--herdr-agent".to_owned(),
+        settings.agent_label.clone(),
+        "--network".to_owned(),
+        network.to_owned(),
+        "--here".to_owned(),
+        "--no-worktree".to_owned(),
+        "--config-hash".to_owned(),
+        config_hash.to_owned(),
+    ];
+    if let Some(cores) = &settings.limits.cpu_cores {
+        arguments.extend([
+            "--cpu-cores".to_owned(),
+            cores
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ]);
+    } else if let Some(count) = settings.limits.cpu_count {
+        arguments.extend(["--cpu-count".to_owned(), count.to_string()]);
+    }
+    for mount in &settings.mount_arguments {
+        arguments.extend(["--mount".to_owned(), mount.clone()]);
+    }
+    if settings.verbose {
+        arguments.push("--verbose".to_owned());
+    }
+    let words = std::iter::once(settings.command.executable.as_os_str())
+        .chain(
+            settings
+                .command
+                .arguments
+                .iter()
+                .map(std::ffi::OsString::as_os_str),
+        )
+        .map(|word| word.to_str().ok_or("foreground command is not UTF-8"))
+        .collect::<Result<Vec<_>, _>>()?;
+    arguments.extend(["--command".to_owned(), shell_words::join(words)]);
+    Ok(arguments)
+}
+
 #[tracing::instrument(level = "debug", skip_all, name = "build_launcher_mode")]
 fn launcher_mode(
     args: LauncherArgs,
     mut file: config::FileConfig,
 ) -> Result<SelectedMode, Box<dyn Error>> {
+    // Retain recovery arguments only for guarded launches, never the ordinary hot path.
+    let recovery_args = (args.restored || args.config_hash.is_some()).then(|| args.clone());
+    let socket = if let Some(encoded) = args.socket_bytes {
+        if encoded.len() > 8192 {
+            return Err("encoded control socket is too long".into());
+        }
+        let bytes = decode_hex(&encoded)?;
+        if bytes.contains(&0) {
+            return Err("control socket must not contain NUL".into());
+        }
+        Some(PathBuf::from(OsString::from_vec(bytes)))
+    } else {
+        args.socket
+    };
     file.override_cpu_selection(args.profile.as_deref(), args.cpu_cores, args.cpu_count)?;
+    file.override_network(args.profile.as_deref(), args.network)?;
     file.override_launch_mode(args.profile.as_deref(), args.no_worktree)?;
-    let resume = args.resume.clone();
-    let continuation_token = args.continuation_token.clone();
-    let mut settings = LauncherSettings::resolve(
-        args.socket,
+    let effective = EffectiveLauncherConfig::merge(
+        socket,
         args.name,
         args.profile,
         args.command,
+        args.herdr_agent,
         args.verbose,
         &file,
-    )?;
-    let mount_arguments = config::apply_launch_mounts(
-        &mut settings.runtime,
-        &args.read_only,
-        &args.mounts,
-        &env::current_dir()?,
-    )?;
+    )?
+    .with_launch_mounts(args.read_only, args.mounts)?;
+    let config_hash = effective.fingerprint()?;
+    if let Some(args) = recovery_args {
+        let stdin = io::stdin();
+        let stderr = io::stderr();
+        confirm_config_policy(
+            &args,
+            &config_hash,
+            &mut stdin.lock(),
+            &mut stderr.lock(),
+            stdin.is_terminal() && stderr.is_terminal(),
+        )?;
+    }
+
+    // Declarative launcher intent is complete; host-dependent resolution starts here.
+    let current_directory = env::current_dir()?;
+    let settings = effective.resolve(&current_directory)?;
+    let replay_arguments = canonical_replay_arguments(&settings, &config_hash)?;
     let has_herdr_identity = settings.identity.is_some();
     let mut config = LauncherConfig::new(
         settings.socket,
         settings.profile,
+        settings.agent_label,
         settings.command,
         settings.runtime,
     )
-    .mount_arguments(mount_arguments)
+    .replay_arguments(replay_arguments)
     .resource_limits(settings.limits)
     .no_worktree(args.no_worktree)
     .here(args.here)
@@ -694,10 +884,10 @@ fn launcher_mode(
     if let Some(name) = settings.name {
         config = config.workspace_name(name);
     }
-    if let Some(token) = resume {
+    if let Some(token) = args.resume {
         config = config.resume_token(token);
     }
-    if let Some(token) = continuation_token {
+    if let Some(token) = args.continuation_token {
         config = config.continuation_token(token);
     }
     Ok(SelectedMode {
@@ -744,6 +934,242 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
+
+    const CONFIG_HASH: &str = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn restoration_marker_is_internal_and_outer_replay_metadata_is_rejected() {
+        assert!(Cli::try_parse_from(["runroom", "--restored"]).is_err());
+        let payload = restore_payload(&["--here", "--no-worktree", "--command", "pi"]);
+        let restored = resolve_restore_cli(
+            Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap(),
+        )
+        .unwrap();
+        assert!(restored.launcher.restored);
+        assert!(restored.launcher.config_hash.is_none());
+        for (flag, value) in [("--herdr-agent", "frozen"), ("--config-hash", CONFIG_HASH)] {
+            let cli =
+                Cli::try_parse_from(["runroom", "--restore-args", &payload, flag, value]).unwrap();
+            assert!(resolve_restore_cli(cli).is_err());
+            let cli = Cli::try_parse_from([
+                "runroom",
+                "launcher",
+                "--restore-args",
+                &payload,
+                flag,
+                value,
+            ])
+            .unwrap();
+            assert!(resolve_restore_cli(cli).is_err());
+        }
+    }
+
+    fn restore_payload(arguments: &[&str]) -> String {
+        use std::fmt::Write;
+        serde_json::to_vec(arguments)
+            .unwrap()
+            .iter()
+            .fold(String::new(), |mut encoded, byte| {
+                write!(encoded, "{byte:02x}").unwrap();
+                encoded
+            })
+    }
+
+    #[test]
+    fn durable_replay_captures_resolved_policy_and_command_without_workspace_routing() {
+        let mut file: FileConfig = toml::from_str(
+            r#"
+socket = "/control.sock"
+[launcher]
+profile = "coding"
+name = "original-worktree"
+[launcher.base]
+command = "omp --model 'configured model'"
+herdr_agent = "rr:omp"
+network = "host"
+cpu_cores = [0, 1]
+[launcher.profiles.coding]
+"#,
+        )
+        .unwrap();
+        file.override_network(None, Some(config::NetworkFileMode::None))
+            .unwrap();
+        file.override_cpu_selection(None, None, Some(2)).unwrap();
+        let mut settings = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            None,
+            Some("omp --model 'CLI model' --foo \"a'b\"".to_owned()),
+            None,
+            true,
+            &file,
+        )
+        .unwrap()
+        .resolve(Path::new("/"))
+        .unwrap();
+        settings.mount_arguments = vec!["/host/grant@/grant:ro".to_owned()];
+        let replay = canonical_replay_arguments(&settings, CONFIG_HASH).unwrap();
+        assert_eq!(
+            &replay[..replay.len() - 1],
+            [
+                "--socket",
+                "/control.sock",
+                "--profile",
+                "coding",
+                "--herdr-agent",
+                "rr:omp",
+                "--network",
+                "none",
+                "--here",
+                "--no-worktree",
+                "--config-hash",
+                CONFIG_HASH,
+                "--cpu-count",
+                "2",
+                "--mount",
+                "/host/grant@/grant:ro",
+                "--verbose",
+                "--command",
+            ]
+            .map(str::to_owned)
+        );
+        let payload = restore_payload(&replay.iter().map(String::as_str).collect::<Vec<_>>());
+        let restored = resolve_restore_cli(
+            Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap(),
+        )
+        .unwrap();
+        assert!(restored.launcher.here && restored.launcher.no_worktree);
+        assert!(restored.launcher.restored);
+        assert_eq!(restored.launcher.config_hash.as_deref(), Some(CONFIG_HASH));
+        assert_eq!(restored.launcher.profile.as_deref(), Some("coding"));
+        assert_eq!(restored.launcher.herdr_agent.as_deref(), Some("rr:omp"));
+        assert_eq!(
+            restored.launcher.network,
+            Some(config::NetworkFileMode::None)
+        );
+        assert_eq!(restored.launcher.cpu_count, Some(2));
+        assert_eq!(restored.launcher.name, None);
+        assert_eq!(restored.launcher.mounts, ["/host/grant@/grant:ro"]);
+        assert_eq!(
+            shell_words::split(restored.launcher.command.as_deref().unwrap()).unwrap(),
+            ["omp", "--model", "CLI model", "--foo", "a'b"]
+        );
+        file.launcher.profile = Some("different".to_owned());
+        let changed = file.launcher.profiles.get_mut("coding").unwrap();
+        changed.command = Some("pi --model changed".to_owned());
+        changed.herdr_agent = Some("changed:pi".to_owned());
+        let frozen = EffectiveLauncherConfig::merge(
+            restored.launcher.socket,
+            restored.launcher.name,
+            restored.launcher.profile,
+            restored.launcher.command,
+            restored.launcher.herdr_agent,
+            restored.launcher.verbose,
+            &file,
+        )
+        .unwrap();
+        assert_eq!(frozen.profile, "coding");
+        assert_eq!(frozen.agent_label, "rr:omp");
+        assert_eq!(frozen.command, settings.command);
+    }
+
+    #[test]
+    fn default_agent_label_replay_retains_differently_named_profile() {
+        let file: FileConfig = toml::from_str(
+            "socket = '/control.sock'\n[launcher]\nprofile = 'coding'\n\
+             [launcher.profiles.coding]\ncommand = '/opt/agents/omp --model configured'",
+        )
+        .unwrap();
+        let settings = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+            .unwrap()
+            .resolve(Path::new("/"))
+            .unwrap();
+        let replay = canonical_replay_arguments(&settings, CONFIG_HASH).unwrap();
+        let parsed = Cli::try_parse_from(
+            std::iter::once("runroom").chain(replay.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert_eq!(parsed.launcher.profile.as_deref(), Some("coding"));
+        assert_eq!(parsed.launcher.herdr_agent.as_deref(), Some("omp"));
+        assert_eq!(
+            shell_words::split(parsed.launcher.command.as_deref().unwrap()).unwrap(),
+            ["/opt/agents/omp", "--model", "configured"]
+        );
+        let explicit = Cli::try_parse_from([
+            "runroom",
+            "launcher",
+            "--profile",
+            "coding",
+            "--herdr-agent",
+            "rr:omp",
+        ])
+        .unwrap();
+        let Some(Role::Launcher(args)) = explicit.role else {
+            panic!("expected explicit launcher mode");
+        };
+        assert_eq!(args.profile.as_deref(), Some("coding"));
+        assert_eq!(args.herdr_agent.as_deref(), Some("rr:omp"));
+    }
+
+    #[test]
+    fn restore_payload_rejects_recursion_roles_missing_workspace_flags_and_bounds() {
+        for arguments in [
+            vec!["--here", "--no-worktree", "--restore-args", "00"],
+            vec!["--here", "--no-worktree", "--resume", "token"],
+            vec!["--here", "--no-worktree", "--continuation-token", "token"],
+            vec!["daemon"],
+            vec!["--here"],
+            vec!["--no-worktree"],
+        ] {
+            let payload = restore_payload(&arguments);
+            assert!(
+                resolve_restore_cli(
+                    Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap()
+                )
+                .is_err()
+            );
+        }
+        for payload in [
+            "0".to_owned(),
+            "zz".to_owned(),
+            "FF".to_owned(),
+            "00".repeat(MAX_RESTORE_HEX_BYTES / 2 + 1),
+        ] {
+            assert!(
+                resolve_restore_cli(
+                    Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let many = vec!["--verbose"; 65];
+        let payload = restore_payload(&many);
+        assert!(
+            resolve_restore_cli(
+                Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap()
+            )
+            .is_err()
+        );
+        let payload = restore_payload(&["--here", "--no-worktree", "--command", "pi"]);
+        assert!(
+            resolve_restore_cli(
+                Cli::try_parse_from(["runroom", "--restore-args", &payload, "--here"]).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_network_override_only_for_launchers() {
+        for prefix in [vec!["runroom"], vec!["runroom", "launcher"]] {
+            for network in ["host", "none", "private"] {
+                let mut arguments = prefix.clone();
+                arguments.extend(["--network", network]);
+                assert!(Cli::try_parse_from(arguments).is_ok());
+            }
+        }
+        assert!(Cli::try_parse_from(["runroom", "daemon", "--network", "host"]).is_err());
+    }
 
     #[test]
     fn defaults_to_launcher_and_preserves_non_utf8_socket_paths() {

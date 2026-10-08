@@ -10,17 +10,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ActivityState, ActivityUpdate, HerdrContext, InstanceId, InstanceRecord, InstanceState,
-    LaunchHandoff, LaunchRequest, LauncherContinuation, PrepareLaunchRequest, PreparedLaunch,
-    ProcessId, ProjectId, PrunedWorktrees, ResolvedWorkspace, ResourceLimits, RetiredWorkspace,
-    ServiceAction, ServiceConfiguration, ServiceResult, StopMode, WorkspaceName, WorkspaceOrigin,
-    WorkspaceSelection, WorkspaceSupportMount,
+    ActivityState, ActivityUpdate, AgentSession, HerdrContext, InstanceId, InstanceRecord,
+    InstanceState, LaunchHandoff, LaunchRequest, LauncherContinuation, PrepareLaunchRequest,
+    PreparedLaunch, ProcessId, ProjectId, PrunedWorktrees, ResolvedWorkspace, ResourceLimits,
+    RetiredWorkspace, ServiceAction, ServiceConfiguration, ServiceResult, StopMode, WorkspaceName,
+    WorkspaceOrigin, WorkspaceSelection, WorkspaceSupportMount,
 };
 use crate::protocol::{
-    APP_VERSION, ControlError, ControlOperation, ControlRequest, ControlResponse, ControlResult,
+    APP_VERSION, CONTROL_WIRE_VERSION, ControlError, ControlOperation, ControlRequest,
+    ControlResponse, ControlResult,
 };
 
-const MAGIC: [u8; 4] = *b"RRM\0";
+const MAGIC: [u8; 4] = [b'R', b'R', b'M', CONTROL_WIRE_VERSION];
 const CLIENT_HELLO_KIND: u8 = 1;
 const DAEMON_HELLO_KIND: u8 = 2;
 const REQUEST_KIND: u8 = 3;
@@ -274,6 +275,7 @@ struct WireRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)] // One bounded IPC envelope; avoid a heap allocation per request.
 #[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 enum WireRequestOperation {
     PrepareLaunch {
@@ -281,6 +283,8 @@ enum WireRequestOperation {
         name: Option<String>,
         here: bool,
         profile: String,
+        agent_label: String,
+        replay_arguments: Vec<String>,
         limits: WireResourceLimits,
         herdr: Option<WireHerdrContext>,
         no_multiplex: bool,
@@ -388,6 +392,7 @@ impl TryFrom<&ControlRequest> for WireRequest {
 impl TryFrom<WireRequest> for ControlRequest {
     type Error = io::Error;
 
+    #[allow(clippy::too_many_lines)] // Exhaustive wire-operation decoding and validation stay together.
     fn try_from(request: WireRequest) -> io::Result<Self> {
         let operation = match request.operation {
             WireRequestOperation::PrepareLaunch {
@@ -395,6 +400,8 @@ impl TryFrom<WireRequest> for ControlRequest {
                 name,
                 here,
                 profile,
+                agent_label,
+                replay_arguments,
                 limits,
                 herdr,
                 no_multiplex,
@@ -402,6 +409,8 @@ impl TryFrom<WireRequest> for ControlRequest {
                 continuation_token,
             } => {
                 validate_name(&profile, "profile")?;
+                validate_agent_label(&agent_label)?;
+                validate_replay_arguments(&replay_arguments)?;
                 let limits = ResourceLimits::from(limits);
                 validate_limits(&limits)?;
                 let herdr = herdr.map(HerdrContext::from);
@@ -422,6 +431,8 @@ impl TryFrom<WireRequest> for ControlRequest {
                         workspace: name_to_selection(name, here)?,
                     },
                     profile,
+                    agent_label,
+                    replay_arguments,
                     limits,
                     herdr,
                     no_multiplex,
@@ -534,6 +545,7 @@ struct WireLaunchHandoff {
     socket_path: Vec<u8>,
     command: String,
     mount_arguments: Vec<String>,
+    replay_arguments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -543,8 +555,10 @@ struct WireLauncherContinuation {
     name: Option<String>,
     here: bool,
     profile: String,
+    agent_label: String,
     command: String,
     mount_arguments: Vec<String>,
+    replay_arguments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -590,6 +604,8 @@ struct WireInstanceRecord {
     scope_handle: String,
     workspace: WireWorkspace,
     profile: String,
+    agent_label: String,
+    replay_arguments: Vec<String>,
     limits: WireResourceLimits,
     leader: u32,
     state: WireInstanceState,
@@ -677,6 +693,7 @@ struct WireHerdrContext {
 struct WireActivity {
     state: WireActivityState,
     message: Option<String>,
+    session: Option<AgentSession>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -859,6 +876,8 @@ fn wire_prepare_launch(request: &PrepareLaunchRequest) -> io::Result<WireRequest
     validate_path(request.workspace.current_directory.as_os_str())?;
     let name = selection_name(&request.workspace.workspace)?;
     validate_name(&request.profile, "profile")?;
+    validate_agent_label(&request.agent_label)?;
+    validate_replay_arguments(&request.replay_arguments)?;
     validate_limits(&request.limits)?;
     if let Some(context) = &request.herdr {
         validate_context(context)?;
@@ -883,6 +902,8 @@ fn wire_prepare_launch(request: &PrepareLaunchRequest) -> io::Result<WireRequest
         name,
         here: matches!(request.workspace.workspace, WorkspaceSelection::Here),
         profile: request.profile.clone(),
+        agent_label: request.agent_label.clone(),
+        replay_arguments: request.replay_arguments.clone(),
         limits: (&request.limits).into(),
         herdr: request.herdr.as_ref().map(Into::into),
         no_multiplex: request.no_multiplex,
@@ -902,10 +923,12 @@ fn wire_handoff(handoff: &LaunchHandoff) -> io::Result<WireLaunchHandoff> {
     }
     validate_command(&handoff.command)?;
     validate_mount_arguments(&handoff.mount_arguments)?;
+    validate_replay_arguments(&handoff.replay_arguments)?;
     Ok(WireLaunchHandoff {
         socket_path: handoff.socket_path.as_os_str().as_bytes().to_vec(),
         command: handoff.command.clone(),
         mount_arguments: handoff.mount_arguments.clone(),
+        replay_arguments: handoff.replay_arguments.clone(),
     })
 }
 
@@ -917,10 +940,13 @@ fn model_handoff(handoff: WireLaunchHandoff) -> io::Result<LaunchHandoff> {
     validate_command(&handoff.command)?;
     validate_mount_arguments(&handoff.mount_arguments)
         .map_err(|error| invalid_data(error.to_string()))?;
+    validate_replay_arguments(&handoff.replay_arguments)
+        .map_err(|error| invalid_data(error.to_string()))?;
     Ok(LaunchHandoff {
         socket_path,
         command: handoff.command,
         mount_arguments: handoff.mount_arguments,
+        replay_arguments: handoff.replay_arguments,
     })
 }
 
@@ -931,15 +957,19 @@ fn wire_continuation(continuation: &LauncherContinuation) -> io::Result<WireLaun
     }
     let name = selection_name(&continuation.workspace)?;
     validate_name(&continuation.profile, "continuation profile")?;
+    validate_agent_label(&continuation.agent_label)?;
     validate_command(&continuation.command)?;
     validate_mount_arguments(&continuation.mount_arguments)?;
+    validate_replay_arguments(&continuation.replay_arguments)?;
     Ok(WireLauncherContinuation {
         socket_path: continuation.socket_path.as_os_str().as_bytes().to_vec(),
         name,
         here: matches!(continuation.workspace, WorkspaceSelection::Here),
         profile: continuation.profile.clone(),
+        agent_label: continuation.agent_label.clone(),
         command: continuation.command.clone(),
         mount_arguments: continuation.mount_arguments.clone(),
+        replay_arguments: continuation.replay_arguments.clone(),
     })
 }
 
@@ -949,15 +979,20 @@ fn model_continuation(continuation: WireLauncherContinuation) -> io::Result<Laun
         return Err(invalid_data("continuation socket must be absolute"));
     }
     validate_name(&continuation.profile, "continuation profile")?;
+    validate_agent_label(&continuation.agent_label)?;
     validate_command(&continuation.command)?;
     validate_mount_arguments(&continuation.mount_arguments)
+        .map_err(|error| invalid_data(error.to_string()))?;
+    validate_replay_arguments(&continuation.replay_arguments)
         .map_err(|error| invalid_data(error.to_string()))?;
     Ok(LauncherContinuation {
         socket_path,
         workspace: name_to_selection(continuation.name, continuation.here)?,
         profile: continuation.profile,
+        agent_label: continuation.agent_label,
         command: continuation.command,
         mount_arguments: continuation.mount_arguments,
+        replay_arguments: continuation.replay_arguments,
     })
 }
 
@@ -1060,7 +1095,9 @@ fn wire_instance(instance: &InstanceRecord) -> io::Result<WireInstanceRecord> {
     validate_name(&instance.id.0, "instance ID")?;
     validate_name(&instance.scope_handle, "scope handle")?;
     validate_name(&instance.profile, "profile")?;
+    validate_agent_label(&instance.agent_label)?;
     validate_limits(&instance.limits)?;
+    validate_replay_arguments(&instance.replay_arguments)?;
     if let Some(activity) = &instance.activity {
         validate_activity(activity)?;
     }
@@ -1077,6 +1114,8 @@ fn wire_instance(instance: &InstanceRecord) -> io::Result<WireInstanceRecord> {
         scope_handle: instance.scope_handle.clone(),
         workspace: wire_workspace(&instance.workspace)?,
         profile: instance.profile.clone(),
+        agent_label: instance.agent_label.clone(),
+        replay_arguments: instance.replay_arguments.clone(),
         limits: (&instance.limits).into(),
         leader: instance.leader.0.get(),
         state: instance.state.into(),
@@ -1091,6 +1130,8 @@ fn model_instance(instance: WireInstanceRecord) -> io::Result<InstanceRecord> {
     validate_name(&instance.id, "instance ID")?;
     validate_name(&instance.scope_handle, "scope handle")?;
     validate_name(&instance.profile, "profile")?;
+    validate_agent_label(&instance.agent_label)?;
+    validate_replay_arguments(&instance.replay_arguments)?;
     let limits = instance.limits.into();
     validate_limits(&limits)?;
     let activity = instance.activity.map(ActivityUpdate::from);
@@ -1113,6 +1154,8 @@ fn model_instance(instance: WireInstanceRecord) -> io::Result<InstanceRecord> {
         scope_handle: instance.scope_handle,
         workspace: model_workspace(instance.workspace)?,
         profile: instance.profile,
+        agent_label: instance.agent_label,
+        replay_arguments: instance.replay_arguments,
         limits,
         leader: ProcessId(leader),
         state: instance.state.into(),
@@ -1238,6 +1281,18 @@ fn validate_mount_arguments(arguments: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_replay_arguments(arguments: &[String]) -> io::Result<()> {
+    if arguments.len() > 512 || arguments.iter().map(String::len).sum::<usize>() > 8192 {
+        return Err(invalid_input(
+            "replay arguments exceed 512 arguments or 8192 bytes; shorten the command or mounts",
+        ));
+    }
+    if arguments.iter().any(|argument| argument.contains('\0')) {
+        return Err(invalid_input("replay arguments contain NUL"));
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str, field: &str) -> io::Result<()> {
     if name.is_empty() || name.len() > MAX_NAME_LEN || name.chars().any(char::is_control) {
         return Err(invalid_input(format!(
@@ -1306,6 +1361,21 @@ fn validate_context(context: &HerdrContext) -> io::Result<()> {
 fn validate_activity(activity: &ActivityUpdate) -> io::Result<()> {
     if let Some(message) = &activity.message {
         validate_diagnostic(message, "activity message")?;
+    }
+    if let Some(session) = &activity.session {
+        validate_session(session)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_session(session: &AgentSession) -> io::Result<()> {
+    if session.reference.is_empty()
+        || session.reference.len() > 4096
+        || session.reference.chars().any(char::is_control)
+    {
+        return Err(invalid_input(
+            "session reference is empty, exceeds 4096 bytes, or contains control characters",
+        ));
     }
     Ok(())
 }
@@ -1397,6 +1467,7 @@ impl From<&ActivityUpdate> for WireActivity {
         Self {
             state: value.state.into(),
             message: value.message.clone(),
+            session: value.session.clone(),
         }
     }
 }
@@ -1406,6 +1477,7 @@ impl From<WireActivity> for ActivityUpdate {
         Self {
             state: value.state.into(),
             message: value.message,
+            session: value.session,
         }
     }
 }
@@ -1423,9 +1495,122 @@ fn invalid_data(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) ->
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn validate_agent_label(label: &str) -> io::Result<()> {
+    if crate::model::valid_agent_label(label) {
+        Ok(())
+    } else {
+        Err(invalid_data("invalid agent label"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_agent_label_uses_herdr_bounds_and_wire_revision() {
+        assert_eq!(MAGIC, *b"RRM\x02");
+        for label in ["", "bad\nlabel", "bad\0label", "bad\u{85}label"] {
+            assert!(validate_agent_label(label).is_err());
+        }
+        assert!(validate_agent_label(&"x".repeat(512)).is_ok());
+        assert!(validate_agent_label(&"x".repeat(513)).is_err());
+        assert!(validate_agent_label("rr:omp").is_ok());
+    }
+    #[test]
+    fn request_and_continuation_consumers_recover_complete_resolved_replay_policy() {
+        let replay: Vec<String> = [
+            "--socket",
+            "/run/runroom.sock",
+            "--profile",
+            "coding",
+            "--herdr-agent",
+            "omp",
+            "--network",
+            "none",
+            "--cpu-cores",
+            "1,3",
+            "--here",
+            "--no-worktree",
+            "--mount",
+            "/source@/target:ro",
+            "--command",
+            "omp --model 'configured model'",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut request = directory_request();
+        let ControlOperation::PrepareLaunch(prepare) = &mut request.operation else {
+            unreachable!()
+        };
+        prepare.profile = "coding".to_owned();
+        prepare.agent_label = "omp".to_owned();
+        prepare.replay_arguments = replay.clone();
+        prepare.continuation.as_mut().unwrap().replay_arguments = replay.clone();
+        let (mut launcher, mut daemon) = UnixStream::pair().unwrap();
+        write_control_request(&mut launcher, &request).unwrap();
+        let recovered = read_control_request(&mut daemon).unwrap();
+        let ControlOperation::PrepareLaunch(prepare) = recovered.operation else {
+            unreachable!()
+        };
+        assert_eq!(prepare.replay_arguments, replay);
+        assert_eq!(prepare.profile, "coding");
+        assert_eq!(prepare.agent_label, "omp");
+        let handoff = prepare.continuation.unwrap();
+        assert_eq!(handoff.replay_arguments, replay);
+        let continuation = LauncherContinuation {
+            socket_path: handoff.socket_path,
+            workspace: WorkspaceSelection::Primary,
+            profile: prepare.profile,
+            agent_label: prepare.agent_label,
+            command: handoff.command,
+            mount_arguments: handoff.mount_arguments,
+            replay_arguments: handoff.replay_arguments,
+        };
+        write_control_response(
+            &mut daemon,
+            &ControlResponse {
+                request_id: 1,
+                result: Ok(ControlResult::LaunchContinuation(continuation)),
+            },
+        )
+        .unwrap();
+        let response = read_control_response(&mut launcher).unwrap();
+        let Ok(ControlResult::LaunchContinuation(restored)) = response.result else {
+            unreachable!()
+        };
+        assert_eq!(restored.workspace, WorkspaceSelection::Primary);
+        assert_eq!(restored.replay_arguments, replay);
+        assert_eq!(restored.profile, "coding");
+        assert_eq!(restored.agent_label, "omp");
+    }
+
+    #[test]
+    fn replay_boundaries_reject_excess_without_truncating() {
+        assert!(validate_replay_arguments(&vec!["x".to_owned(); 512]).is_ok());
+        assert!(validate_replay_arguments(&vec!["x".to_owned(); 513]).is_err());
+        assert!(validate_replay_arguments(&["x".repeat(8193)]).is_err());
+        assert!(validate_replay_arguments(&["nul\0".to_owned()]).is_err());
+        assert!(validate_replay_arguments(&["x".repeat(8192)]).is_ok());
+        let mut continuation = LauncherContinuation {
+            socket_path: PathBuf::from("/run/runroom.sock"),
+            workspace: WorkspaceSelection::Primary,
+            profile: "custom".to_owned(),
+            agent_label: "pi".to_owned(),
+            command: "pi".to_owned(),
+            mount_arguments: Vec::new(),
+            replay_arguments: vec!["x".to_owned(); 513],
+        };
+        assert!(wire_continuation(&continuation).is_err());
+        continuation.replay_arguments.clear();
+        let mut wire = wire_continuation(&continuation).unwrap();
+        wire.replay_arguments = vec!["x".repeat(8193)];
+        assert_eq!(
+            model_continuation(wire).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn directory_workspace() -> ResolvedWorkspace {
         ResolvedWorkspace {
@@ -1448,6 +1633,8 @@ mod tests {
                     current_directory: PathBuf::from("/project/nested"),
                 },
                 profile: "native".to_owned(),
+                agent_label: "true".to_owned(),
+                replay_arguments: Vec::new(),
                 limits: ResourceLimits::default(),
                 herdr: None,
                 no_multiplex: false,
@@ -1455,6 +1642,7 @@ mod tests {
                     socket_path: PathBuf::from("/run/runroom/control.sock"),
                     command: "printf directory".to_owned(),
                     mount_arguments: Vec::new(),
+                    replay_arguments: Vec::new(),
                 })),
                 continuation_token: None,
             }),
@@ -1480,6 +1668,7 @@ mod tests {
                 socket_path: PathBuf::from("/run/runroom/control.sock"),
                 command: "true".to_owned(),
                 mount_arguments: mount_arguments.clone(),
+                replay_arguments: Vec::new(),
             };
             assert!(wire_handoff(&handoff).is_err());
             assert_eq!(
@@ -1487,6 +1676,7 @@ mod tests {
                     socket_path: b"/run/runroom/control.sock".to_vec(),
                     command: "true".to_owned(),
                     mount_arguments: mount_arguments.clone(),
+                    replay_arguments: Vec::new(),
                 })
                 .unwrap_err()
                 .kind(),
@@ -1496,8 +1686,10 @@ mod tests {
                 socket_path: handoff.socket_path,
                 workspace: WorkspaceSelection::Here,
                 profile: "sandbox".to_owned(),
+                agent_label: "true".to_owned(),
                 command: handoff.command,
                 mount_arguments: mount_arguments.clone(),
+                replay_arguments: Vec::new(),
             };
             assert!(wire_continuation(&continuation).is_err());
             assert_eq!(
@@ -1506,8 +1698,10 @@ mod tests {
                     name: None,
                     here: true,
                     profile: "sandbox".to_owned(),
+                    agent_label: "true".to_owned(),
                     command: "true".to_owned(),
                     mount_arguments,
+                    replay_arguments: Vec::new(),
                 })
                 .unwrap_err()
                 .kind(),
@@ -1536,8 +1730,10 @@ mod tests {
             name: Some("named".to_owned()),
             here: true,
             profile: "native".to_owned(),
+            agent_label: "true".to_owned(),
             command: "true".to_owned(),
             mount_arguments: Vec::new(),
+            replay_arguments: Vec::new(),
         };
         assert!(model_continuation(continuation).is_err());
 
@@ -1675,6 +1871,8 @@ mod tests {
                         current_directory: PathBuf::from("/project"),
                     },
                     profile: "native".to_owned(),
+                    agent_label: "true".to_owned(),
+                    replay_arguments: Vec::new(),
                     limits: limits.clone(),
                     herdr: None,
                     no_multiplex: false,
@@ -1694,6 +1892,8 @@ mod tests {
                     name: None,
                     here: false,
                     profile: "native".to_owned(),
+                    agent_label: "true".to_owned(),
+                    replay_arguments: Vec::new(),
                     limits: (&limits).into(),
                     herdr: None,
                     no_multiplex: false,

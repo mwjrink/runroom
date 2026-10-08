@@ -8,7 +8,8 @@ mod workspace;
 
 pub use identity::{InstanceId, ProcessId, ProjectId, UserId, WorkspaceName};
 pub use instance::{
-    ActivityState, ActivityUpdate, HerdrContext, InstanceRecord, InstanceState, StopMode,
+    ActivityState, ActivityUpdate, AgentSession, HerdrContext, InstanceRecord, InstanceState,
+    SessionAgent, StopMode,
 };
 pub use launch::{
     BindAccess, BindMount, BindMountSource, DeviceMount, EnvironmentVariable, ForegroundCommand,
@@ -21,3 +22,8 @@ pub use workspace::{
     CanonicalProject, PrunedWorktrees, ResolvedWorkspace, RetiredWorkspace, WorkspaceOrigin,
     WorkspaceSelection, WorkspaceSupportMount,
 };
+
+/// Herdr's bounded single-line agent label rules.
+pub fn valid_agent_label(label: &str) -> bool {
+    !label.is_empty() && label.len() <= 512 && !label.chars().any(char::is_control)
+}

@@ -29,10 +29,10 @@ use crate::backend::{
 };
 use crate::environment::{PROJECT_ENV_KEYS, ProjectEnvironment};
 use crate::model::{
-    ActivityState, ActivityUpdate, CanonicalProject, HerdrContext, InstanceId, InstanceRecord,
-    InstanceState, LauncherContinuation, PreparedLaunch, ProcessId, ProjectId, ResolvedWorkspace,
-    ResourceLimits, ServiceAction, ServiceConfiguration, ServiceResult, StopMode, UserId,
-    WorkspaceSelection,
+    ActivityState, ActivityUpdate, AgentSession, CanonicalProject, HerdrContext, InstanceId,
+    InstanceRecord, InstanceState, LauncherContinuation, PreparedLaunch, ProcessId, ProjectId,
+    ResolvedWorkspace, ResourceLimits, ServiceAction, ServiceConfiguration, ServiceResult,
+    SessionAgent, StopMode, UserId, WorkspaceSelection,
 };
 use crate::protocol::{
     APP_VERSION, ControlError, ControlOperation, ControlResponse, ControlResult,
@@ -46,16 +46,17 @@ use super::RunToken;
 use super::registry::{InstanceRegistry, RegistryLease, now_ms};
 
 static INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ACTIVITY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static ACTIVITY_SEQUENCE: Mutex<u64> = Mutex::new(0);
 const WORKER_COUNT: usize = 8;
 const WORK_QUEUE: usize = 16;
 const ACTIVITY_WORKER_COUNT: usize = 2;
 const ACTIVITY_WORK_QUEUE: usize = 16;
 const ACTIVITY_MAGIC: [u8; 4] = [0x52, 0x52, 0x41, 0x00];
-const ACTIVITY_PROTOCOL_VERSION: u8 = 1;
+const ACTIVITY_PROTOCOL_VERSION: u8 = 2;
 const ACTIVITY_HEADER_BYTES: usize = 8;
 const ACTIVITY_ACK: u8 = 0;
 const MAX_ACTIVITY_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_ACTIVITY_BODY_BYTES: usize = 16 * 1024;
 const HERDR_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HERDR_DISCOVERY_BYTES: usize = 64 * 1024;
 const CONTINUATION_TTL: Duration = Duration::from_secs(30);
@@ -458,29 +459,55 @@ fn read_activity_report(stream: &mut UnixStream) -> io::Result<ActivityUpdate> {
             ));
         }
     };
-    let message_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
-    if message_len > MAX_ACTIVITY_MESSAGE_BYTES {
+    let body_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
+    if body_len > MAX_ACTIVITY_BODY_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "activity message exceeds maximum size",
+            "activity JSON body exceeds 16384 bytes",
         ));
     }
-    let message = if message_len == 0 {
-        None
-    } else {
-        let mut bytes = vec![0_u8; message_len];
-        stream.read_exact(&mut bytes)?;
-        let message = String::from_utf8(bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid activity message"))?;
-        if message.chars().any(char::is_control) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "activity message contains control characters",
-            ));
-        }
-        Some(message)
-    };
-    Ok(ActivityUpdate { state, message })
+    let mut bytes = vec![0_u8; body_len];
+    stream.read_exact(&mut bytes)?;
+    let body: ActivityBody = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if body.message.as_ref().is_some_and(|message| {
+        message.len() > MAX_ACTIVITY_MESSAGE_BYTES || message.chars().any(char::is_control)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "activity message exceeds 4096 bytes or contains control characters",
+        ));
+    }
+    if let Some(session) = &body.session {
+        crate::transport::validate_session(session)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    }
+    Ok(ActivityUpdate {
+        state,
+        message: body.message,
+        session: body.session,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityBody {
+    message: Option<String>,
+    session: Option<AgentSession>,
+}
+
+fn next_activity_sequence() -> u64 {
+    let wall_clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut sequence = ACTIVITY_SEQUENCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *sequence = wall_clock.max(sequence.saturating_add(1));
+    *sequence
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "handle_daemon_connection")]
@@ -556,7 +583,7 @@ fn issue_continuation(
             message: "too many pending launcher continuations".to_owned(),
         });
     }
-    let sequence = ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = next_activity_sequence();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -854,8 +881,10 @@ fn redirect_launch(
     let continuation = LauncherContinuation {
         socket_path: handoff.socket_path,
         profile: std::mem::take(&mut request.profile),
+        agent_label: std::mem::take(&mut request.agent_label),
         command: handoff.command,
         mount_arguments: handoff.mount_arguments,
+        replay_arguments: handoff.replay_arguments,
         workspace: std::mem::replace(&mut request.workspace.workspace, WorkspaceSelection::Here),
     };
     let context = HerdrContext {
@@ -1069,6 +1098,8 @@ fn prepare_launch(
         scope_handle: handle.0.clone(),
         workspace: workspace.clone(),
         profile: request.profile,
+        agent_label: request.agent_label,
+        replay_arguments: request.replay_arguments,
         limits: request.limits,
         leader: caller.process,
         state: InstanceState::Running,
@@ -1391,22 +1422,212 @@ fn publish_instance_activity(
         .cloned()
         .ok_or_else(|| permission_denied("caller scope is not present in the instance registry"))?;
     let (herdr, pane) = verify_instance_pane(&existing, herdr_router)?;
+    let resume_argv = activity
+        .session
+        .as_ref()
+        .map(|session| session_resume_argv(&existing.replay_arguments, session))
+        .transpose()?
+        .flatten();
     lock_state(state)?
         .registry
         .update(id, |record| {
-            record.activity = Some(activity.clone());
+            let mut update = activity.clone();
+            if update.session.is_none() {
+                update.session = record
+                    .activity
+                    .as_ref()
+                    .and_then(|previous| previous.session.clone());
+            }
+            record.activity = Some(update);
             record.updated_at_ms = now_ms();
         })
         .map_err(|error| state_error(&error))?;
     herdr
         .publish_activity(
             &pane.pane_id,
-            &existing.profile,
+            &existing.agent_label,
             activity_state(activity.state),
             activity.message.as_deref(),
-            ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            next_activity_sequence(),
+            resume_argv.as_deref(),
         )
         .map_err(|error| herdr_control_error(&error))
+}
+
+/// Rewrites only the trusted foreground command; sandbox reports supply a reference,
+/// never a profile, socket, outer argument, or host executable.
+fn session_resume_argv(
+    replay_arguments: &[String],
+    session: &AgentSession,
+) -> Result<Option<Vec<String>>, ControlError> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if replay_arguments.is_empty() {
+        return Ok(None);
+    }
+    crate::transport::validate_session(session).map_err(|error| replay_error(error.to_string()))?;
+    let command_index = replay_arguments
+        .iter()
+        .position(|argument| argument == "--command")
+        .ok_or_else(|| replay_error("saved launcher arguments have no foreground command"))?;
+    let command = replay_arguments
+        .get(command_index + 1)
+        .ok_or_else(|| replay_error("saved foreground command has no value"))?;
+    let mut foreground = shell_words::split(command)
+        .map_err(|error| replay_error(format!("cannot parse saved foreground command: {error}")))?;
+    let provider = match session.agent {
+        SessionAgent::Pi => "pi",
+        SessionAgent::Omp => "omp",
+    };
+    if foreground
+        .first()
+        .and_then(|executable| Path::new(executable).file_name())
+        .and_then(|name| name.to_str())
+        != Some(provider)
+    {
+        return Err(permission_denied(
+            "reported session provider does not match the trusted foreground executable",
+        ));
+    }
+    let mut index = 1;
+    let mut separator = None;
+    while index < foreground.len() {
+        let argument = &foreground[index];
+        let flag = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(flag, _)| flag);
+        let has_inline_value = flag.len() != argument.len();
+        let session_value = matches!(flag, "--session" | "--fork")
+            || (session.agent == SessionAgent::Pi && flag == "--session-id")
+            || (session.agent == SessionAgent::Omp && matches!(flag, "--resume" | "-r"));
+        if session_value {
+            let remove_value = !has_inline_value
+                && foreground.get(index + 1).is_some_and(|value| {
+                    session.agent == SessionAgent::Pi
+                        || (!value.is_empty() && !value.starts_with('-'))
+                });
+            foreground.remove(index);
+            if remove_value {
+                foreground.remove(index);
+            }
+        } else if matches!(
+            flag,
+            "--resume" | "-r" | "--continue" | "-c" | "--no-session"
+        ) {
+            foreground.remove(index);
+        } else if argument == "--" {
+            separator = Some(index);
+            break;
+        } else {
+            // Values of configured flags can themselves look like session flags.
+            index += if !has_inline_value && foreground_value_flag(flag, session.agent) {
+                2
+            } else {
+                1
+            };
+        }
+    }
+    // Add options before a positional separator so provider parsers consume them.
+    let insert = separator.unwrap_or(foreground.len());
+    match session.agent {
+        SessionAgent::Pi => {
+            foreground.insert(insert, "--session".to_owned());
+            foreground.insert(insert + 1, session.reference.clone());
+        }
+        SessionAgent::Omp => {
+            foreground.insert(insert, format!("--resume={}", session.reference));
+        }
+    }
+    let mut replay = replay_arguments.to_vec();
+    replay[command_index + 1] = shell_words::join(&foreground);
+    crate::transport::validate_replay_arguments(&replay)
+        .map_err(|error| replay_error(error.to_string()))?;
+    let json = serde_json::to_vec(&replay).map_err(|error| replay_error(error.to_string()))?;
+    let encoded_len = json
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| replay_error("replay payload is too large"))?;
+    if "runroom".len() + "--restore-args".len() + encoded_len > 8192 {
+        return Err(replay_error(
+            "Herdr replay exceeds its 8192-byte argv limit; shorten the command, session path, or CLI mounts",
+        ));
+    }
+    let mut encoded = String::with_capacity(encoded_len);
+    for byte in json {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    Ok(Some(vec![
+        "runroom".to_owned(),
+        "--restore-args".to_owned(),
+        encoded,
+    ]))
+}
+
+fn replay_error(message: impl Into<String>) -> ControlError {
+    ControlError {
+        code: "session_replay_invalid".to_owned(),
+        message: message.into(),
+    }
+}
+
+fn foreground_value_flag(flag: &str, agent: SessionAgent) -> bool {
+    if matches!(
+        flag,
+        "--provider"
+            | "--model"
+            | "--api-key"
+            | "--system-prompt"
+            | "--append-system-prompt"
+            | "--mode"
+            | "--thinking"
+            | "--session-dir"
+            | "--models"
+            | "--tools"
+            | "--export"
+            | "--extension"
+            | "-e"
+    ) {
+        return true;
+    }
+    match agent {
+        SessionAgent::Pi => matches!(
+            flag,
+            "--name"
+                | "-n"
+                | "-t"
+                | "--exclude-tools"
+                | "-xt"
+                | "--skill"
+                | "--prompt-template"
+                | "--theme"
+                | "--use-theme"
+                | "--tui-mode"
+        ),
+        SessionAgent::Omp => matches!(
+            flag,
+            "--cwd"
+                | "--config"
+                | "--add-dir"
+                | "--profile"
+                | "--alias"
+                | "--smol"
+                | "--slow"
+                | "--goal"
+                | "--plan"
+                | "--prewalk-into"
+                | "--plan-yolo-into"
+                | "--max-time"
+                | "--service-tier"
+                | "--system-prompt-template"
+                | "--provider-session-id"
+                | "--prompt-cache-key"
+                | "--hook"
+                | "--trusted-extension"
+                | "--plugin-dir"
+                | "--skills"
+                | "--approval-mode"
+        ),
+    }
 }
 
 const fn activity_state(state: ActivityState) -> HerdrActivityState {
@@ -1854,6 +2075,252 @@ impl Drop for SocketCleanup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_arguments(command: &str) -> Vec<String> {
+        [
+            "--socket",
+            "/run/user/1000/runroom.sock",
+            "--profile",
+            "coding",
+            "--herdr-agent",
+            "omp",
+            "--network",
+            "private",
+            "--cpu-cores",
+            "2,4",
+            "--here",
+            "--no-worktree",
+            "--mount",
+            "/source@/destination:ro",
+            "--command",
+            command,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
+    fn decode_resume(arguments: &[String]) -> Vec<String> {
+        assert_eq!(&arguments[..2], ["runroom", "--restore-args"]);
+        let bytes: Vec<u8> = arguments[2]
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn session_replacement_retains_outer_policy_and_inner_configured_flags() {
+        for (agent, command, expected) in [
+            (
+                SessionAgent::Pi,
+                "/opt/bin/pi --model fast --session '/old session.json' --thinking high --continue",
+                vec![
+                    "/opt/bin/pi",
+                    "--model",
+                    "fast",
+                    "--thinking",
+                    "high",
+                    "--session",
+                    "/new session's file.json",
+                ],
+            ),
+            (
+                SessionAgent::Omp,
+                "/opt/bin/omp --model fast --resume=old --thinking high --resume --continue",
+                vec![
+                    "/opt/bin/omp",
+                    "--model",
+                    "fast",
+                    "--thinking",
+                    "high",
+                    "--resume=/new session's file.json",
+                ],
+            ),
+        ] {
+            let saved = saved_arguments(command);
+            let session = AgentSession {
+                agent,
+                reference: "/new session's file.json".to_owned(),
+            };
+            let wrapper = session_resume_argv(&saved, &session).unwrap().unwrap();
+            assert!(!wrapper.iter().any(|value| value.contains('\'')));
+            let replay = decode_resume(&wrapper);
+            assert_eq!(&replay[..replay.len() - 1], &saved[..saved.len() - 1]);
+            assert_eq!(
+                shell_words::split(replay.last().unwrap()).unwrap(),
+                expected
+            );
+            let changed = AgentSession {
+                agent,
+                reference: "replacement-id".to_owned(),
+            };
+            let replacement =
+                decode_resume(&session_resume_argv(&replay, &changed).unwrap().unwrap());
+            let inner = shell_words::split(replacement.last().unwrap()).unwrap();
+            assert!(!inner.iter().any(|value| value.contains("/new session")));
+            assert!(inner.iter().any(|value| value.contains("replacement-id")));
+        }
+    }
+
+    #[test]
+    fn pi_boolean_resume_keeps_prompt_and_configured_flag_shaped_values() {
+        let session = AgentSession {
+            agent: SessionAgent::Pi,
+            reference: "/new.json".to_owned(),
+        };
+        let saved = saved_arguments(
+            "pi --system-prompt --resume --resume 'keep this prompt' --session-id old --fork /old.json --session-dir /saved -- --resume",
+        );
+        let replay = decode_resume(&session_resume_argv(&saved, &session).unwrap().unwrap());
+        assert_eq!(
+            shell_words::split(replay.last().unwrap()).unwrap(),
+            [
+                "pi",
+                "--system-prompt",
+                "--resume",
+                "keep this prompt",
+                "--session-dir",
+                "/saved",
+                "--session",
+                "/new.json",
+                "--",
+                "--resume"
+            ]
+        );
+    }
+
+    #[test]
+    fn session_replay_rejects_provider_mismatch_and_oversized_wrapper() {
+        let session = AgentSession {
+            agent: SessionAgent::Pi,
+            reference: "/session.json".to_owned(),
+        };
+        for command in ["sh -c pi", "/opt/bin/omp", "python pi"] {
+            assert_eq!(
+                session_resume_argv(&saved_arguments(command), &session)
+                    .unwrap_err()
+                    .code,
+                "permission_denied"
+            );
+        }
+        assert_eq!(session_resume_argv(&[], &session).unwrap(), None);
+        let huge = saved_arguments(&format!("pi --model {}", "x".repeat(5000)));
+        let error = session_resume_argv(&huge, &session).unwrap_err();
+        assert_eq!(error.code, "session_replay_invalid");
+        assert!(error.message.contains("8192-byte"));
+    }
+
+    fn read_report(body: &[u8], version: u8, state: u8) -> io::Result<ActivityUpdate> {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let length = u16::try_from(body.len()).unwrap().to_be_bytes();
+        writer
+            .write_all(&[b'R', b'R', b'A', 0, version, state, length[0], length[1]])
+            .unwrap();
+        writer.write_all(body).unwrap();
+        drop(writer);
+        read_activity_report(&mut reader)
+    }
+
+    #[test]
+    fn activity_v2_consumes_ordered_state_and_session_without_host_inputs() {
+        let report = read_report(
+            br#"{"message":"ready","session":{"agent":"pi","reference":"/absolute/session.json"}}"#,
+            2,
+            1,
+        )
+        .unwrap();
+        assert_eq!(report.state, ActivityState::Blocked);
+        assert_eq!(report.message.as_deref(), Some("ready"));
+        assert_eq!(
+            report.session.unwrap(),
+            AgentSession {
+                agent: SessionAgent::Pi,
+                reference: "/absolute/session.json".to_owned()
+            }
+        );
+        let state_only = read_report(b"{}", 2, 2).unwrap();
+        assert_eq!(state_only.state, ActivityState::Idle);
+        assert_eq!(state_only.session, None);
+    }
+
+    #[test]
+    fn activity_from_unregistered_scope_is_rejected_before_contacting_herdr() {
+        let absent_path = env::temp_dir().join(format!(
+            "runroom-absent-registry-{}-{}",
+            std::process::id(),
+            next_activity_sequence()
+        ));
+        let state = Arc::new(Mutex::new(DaemonState {
+            registry: InstanceRegistry::load(absent_path).unwrap(),
+            continuations: HashMap::new(),
+        }));
+        let router = HerdrRouter::new(PathBuf::from("/nonexistent-herdr.sock"));
+        let report = ActivityUpdate {
+            state: ActivityState::Working,
+            message: None,
+            session: Some(AgentSession {
+                agent: SessionAgent::Pi,
+                reference: "/session.json".to_owned(),
+            }),
+        };
+        let error = publish_instance_activity(
+            &InstanceId("unknown-scope".to_owned()),
+            &report,
+            &state,
+            &router,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "permission_denied");
+        assert!(error.message.contains("not present"));
+    }
+
+    #[test]
+    fn activity_rejects_old_protocol_unknown_fields_invalid_references_and_bounds() {
+        for body in [
+            br#"{"profile":"other"}"#.as_slice(),
+            br#"{"agent_label":"sh"}"#,
+            br#"{"resume_argv":["sh"]}"#,
+            br#"{"session":{"agent":"pi","reference":"id","command":"sh"}}"#,
+            br#"{"session":{"agent":"other","reference":"id"}}"#,
+            br#"{"session":{"agent":"pi","reference":""}}"#,
+            br#"{"session":{"agent":"pi","reference":"bad\nid"}}"#,
+            &[0xff],
+        ] {
+            assert_eq!(
+                read_report(body, 2, 0).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(read_report(b"{}", 1, 0).is_err());
+        assert!(read_report(b"{}", 2, 3).is_err());
+        let oversized_message =
+            serde_json::to_vec(&serde_json::json!({"message": "é".repeat(2049)})).unwrap();
+        assert!(read_report(&oversized_message, 2, 0).is_err());
+        let oversized_reference = serde_json::to_vec(
+            &serde_json::json!({"session": {"agent": "omp", "reference": "x".repeat(4097)}}),
+        )
+        .unwrap();
+        assert!(read_report(&oversized_reference, 2, 0).is_err());
+        assert!(read_report(&vec![b' '; MAX_ACTIVITY_BODY_BYTES + 1], 2, 0).is_err());
+        let boundary = serde_json::to_vec(&serde_json::json!({
+            "message": "é".repeat(2048),
+            "session": {"agent": "pi", "reference": format!("/{}", "x".repeat(4095))},
+        }))
+        .unwrap();
+        assert!(read_report(&boundary, 2, 0).is_ok());
+    }
+
+    #[test]
+    fn activity_sequence_is_wall_clock_based_and_increases() {
+        let first = next_activity_sequence();
+        let second = next_activity_sequence();
+        assert!(first >= now_ms().saturating_sub(1000) * 1000);
+        assert!(second > first);
+    }
 
     #[test]
     fn scalar_ceiling_fills_omissions_without_constraining_cpu_placement() {

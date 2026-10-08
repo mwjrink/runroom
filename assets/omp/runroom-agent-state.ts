@@ -1,16 +1,21 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { Socket } from "node:net";
+import { isAbsolute } from "node:path";
 
 const messageLimit = 4096;
 const socketTimeoutMs = 1000;
 type State = "working" | "blocked" | "idle";
+type Session = { agent: "omp"; reference: string };
+let sessionReporting = false;
+const nestedOmpSession = process.env.OMPCODE === "1";
 
 function activitySocket(): string | undefined {
   try {
     const descriptor = JSON.parse(readFileSync("/runtime/launch.json", "utf8"));
     const socket = descriptor.activity_socket;
     if (descriptor.version === 1 && typeof socket === "string" && socket.startsWith("/") && !socket.includes("\0")) {
+      sessionReporting = descriptor.session_agent === "omp";
       return socket;
     }
   } catch {
@@ -19,21 +24,39 @@ function activitySocket(): string | undefined {
   return undefined;
 }
 
-function stateFrame(state: State, message: string | undefined): Buffer {
+function stateFrame(state: State, message: string | undefined, session: Session | undefined): Buffer {
   const text = Buffer.from(message ?? "", "utf8");
   let length = Math.min(text.length, messageLimit);
-  if (text.length > length) {
-    // A continuation byte at the first excluded position means its entire
-    // code point must be excluded, not sent as malformed UTF-8.
-    while ((text[length] & 0xc0) === 0x80) length -= 1;
-  }
-  const frame = Buffer.alloc(8 + length);
+  let body: Buffer;
+  do {
+    while (length < text.length && (text[length] & 0xc0) === 0x80) length -= 1;
+    body = Buffer.from(JSON.stringify({
+      ...(message === undefined ? {} : { message: text.subarray(0, length).toString("utf8") }),
+      ...(session === undefined ? {} : { session }),
+    }), "utf8");
+    if (body.length <= 16 * 1024) break;
+    // JSON escaping can expand messages; never shorten a session reference.
+    length = Math.floor(length * 0.75);
+  } while (true);
+  const frame = Buffer.alloc(8 + body.length);
   frame.write("RRA\0", 0, "ascii");
-  frame[4] = 1;
+  frame[4] = 2;
   frame[5] = state === "working" ? 0 : state === "blocked" ? 1 : 2;
-  frame.writeUInt16BE(length, 6);
-  text.copy(frame, 8, 0, length);
+  frame.writeUInt16BE(body.length, 6);
+  body.copy(frame, 8);
   return frame;
+}
+
+function sessionReference(ctx: ExtensionContext): Session | undefined {
+  if (!sessionReporting) return undefined;
+  const file = ctx.sessionManager.getSessionFile();
+  const reference = file && isAbsolute(file) ? file : ctx.sessionManager.getSessionId();
+  if (!reference || Buffer.byteLength(reference, "utf8") > 4096 || /\p{Cc}/u.test(reference)) return undefined;
+  return { agent: "omp", reference };
+}
+
+function isRoot(ctx: ExtensionContext): boolean {
+  return ctx.hasUI === true && !nestedOmpSession;
 }
 
 function sendFrame(socketPath: string, frame: Buffer): Promise<boolean> {
@@ -72,6 +95,8 @@ export default function (pi: ExtensionAPI): void {
   const blockers = new Map<string, { count: number; message: string }>();
   let lastState: State | undefined;
   let lastMessage: string | undefined;
+  let session: Session | undefined;
+  let lastReference: string | undefined;
 
   function publish(force = false): Promise<void> {
     let state: State = agentActive ? "working" : "idle";
@@ -81,10 +106,11 @@ export default function (pi: ExtensionAPI): void {
       state = "blocked";
       message = blocker.message;
     }
-    if (!force && state === lastState && message === lastMessage) return queue;
+    if (!force && state === lastState && message === lastMessage && session?.reference === lastReference) return queue;
     lastState = state;
     lastMessage = message;
-    const frame = stateFrame(state, message);
+    lastReference = session?.reference;
+    const frame = stateFrame(state, message, session);
     // Do not coalesce transitions: even a fast start/end must reach the daemon
     // in order. Failed or invalid ACKs settle the queue without retries.
     queue = queue.then(() => sendFrame(socketPath, frame)).then(() => undefined, () => undefined);
@@ -125,7 +151,8 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
+    session = sessionReference(ctx);
     rootSession = true;
     reset();
     // Reloading extensions during a live run does not emit another agent_start.
@@ -133,7 +160,8 @@ export default function (pi: ExtensionAPI): void {
     return publish(true);
   });
   pi.on("session_switch", (_event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
+    session = sessionReference(ctx);
     rootSession = true;
     reset();
     agentActive = ctx.isIdle() === false;
@@ -142,32 +170,34 @@ export default function (pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => {
     // Always inspect this event's context, even after root session activation:
     // a nested/non-UI context must never inherit the root pane's authority.
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
+    session = sessionReference(ctx);
     agentActive = true;
     failureMessage = undefined;
     return publish();
   });
   pi.on("tool_approval_requested", (event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
     return block(`approval:${event.sessionId}:${event.toolCallId}`, event.reason || `${event.toolName} approval`);
   });
   pi.on("tool_approval_resolved", (event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
     return unblock(`approval:${event.sessionId}:${event.toolCallId}`);
   });
   pi.on("tool_execution_start", (event, ctx) => {
-    if (ctx.hasUI !== true || event.toolName !== "ask") return;
+    if (!isRoot(ctx) || event.toolName !== "ask") return;
     const args = event.args as { questions?: unknown } | undefined;
     const questions = Array.isArray(args?.questions) ? args.questions : [];
     const first = questions.find((question) => typeof question?.question === "string" && question.question.length > 0);
     return block(`ask:${event.toolCallId}`, first?.question || "waiting for user input");
   });
   pi.on("tool_execution_end", (event, ctx) => {
-    if (ctx.hasUI !== true || event.toolName !== "ask") return;
+    if (!isRoot(ctx) || event.toolName !== "ask") return;
     return unblock(`ask:${event.toolCallId}`);
   });
   pi.on("agent_end", (event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
+    session = sessionReference(ctx);
     // OMP exposes its actual retry/continuation decision. An intermediate
     // failure is still working, not a user-visible terminal failure or idle.
     if (event.willContinue === true) {
@@ -184,7 +214,7 @@ export default function (pi: ExtensionAPI): void {
     return publish();
   });
   pi.on("session_shutdown", (_event, ctx) => {
-    if (ctx.hasUI !== true) return;
+    if (!isRoot(ctx)) return;
     rootSession = false;
     unsubscribeBlocked();
     return queue;

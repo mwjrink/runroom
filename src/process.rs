@@ -20,6 +20,7 @@ static RUN_TOKEN_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 /// Role and role-specific startup state selected once at process startup.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Startup selects one role once; boxing adds no runtime benefit.
 pub enum RunMode {
     Daemon(DaemonConfig),
     Launcher(LauncherConfig),
@@ -27,6 +28,7 @@ pub enum RunMode {
 
 /// The only role-specific application object created in this process image.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // The selected application is moved once, not stored in collections.
 pub enum Application {
     Daemon(Daemon),
     Launcher(Launcher),
@@ -141,6 +143,7 @@ mod tests {
             RunMode::Launcher(LauncherConfig::new(
                 socket_path,
                 "test".to_owned(),
+                "true".to_owned(),
                 crate::model::ForegroundCommand {
                     executable: "/bin/true".into(),
                     arguments: Vec::new(),

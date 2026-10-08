@@ -35,6 +35,7 @@ pub struct LauncherConfig {
     socket_path: PathBuf,
     workspace_selection: WorkspaceSelection,
     profile: String,
+    agent_label: String,
     command: ForegroundCommand,
     runtime: RuntimePolicy,
     herdr_identity: bool,
@@ -44,7 +45,7 @@ pub struct LauncherConfig {
     environment_allowlist: Vec<String>,
     resume_token: Option<String>,
     continuation_token: Option<String>,
-    mount_arguments: Vec<String>,
+    replay_arguments: Vec<String>,
 }
 
 impl LauncherConfig {
@@ -52,6 +53,7 @@ impl LauncherConfig {
     pub fn new(
         socket_path: impl Into<PathBuf>,
         profile: String,
+        agent_label: String,
         command: ForegroundCommand,
         runtime: RuntimePolicy,
     ) -> Self {
@@ -59,6 +61,7 @@ impl LauncherConfig {
             socket_path: socket_path.into(),
             workspace_selection: WorkspaceSelection::Primary,
             profile,
+            agent_label,
             command,
             runtime,
             herdr_identity: false,
@@ -68,7 +71,7 @@ impl LauncherConfig {
             environment_allowlist: Vec::new(),
             resume_token: None,
             continuation_token: None,
-            mount_arguments: Vec::new(),
+            replay_arguments: Vec::new(),
         }
     }
 
@@ -117,10 +120,10 @@ impl LauncherConfig {
         self
     }
 
-    /// Retain normalized CLI-added mount grants across Herdr routing.
+    /// Retain resolved launcher arguments for durable conversation restoration.
     #[must_use]
-    pub fn mount_arguments(mut self, arguments: Vec<String>) -> Self {
-        self.mount_arguments = arguments;
+    pub fn replay_arguments(mut self, arguments: Vec<String>) -> Self {
+        self.replay_arguments = arguments;
         self
     }
 
@@ -137,6 +140,23 @@ impl LauncherConfig {
         self.continuation_token = Some(token);
         self
     }
+}
+
+fn replay_mount_arguments(arguments: &[String]) -> Vec<String> {
+    let mut arguments = arguments.iter();
+    let mut mounts = Vec::new();
+    while let Some(flag) = arguments.next() {
+        if matches!(flag.as_str(), "--here" | "--no-worktree" | "--verbose") {
+            continue;
+        }
+        let Some(value) = arguments.next() else {
+            break;
+        };
+        if flag == "--mount" {
+            mounts.push(value.clone());
+        }
+    }
+    mounts
 }
 
 /// Foreground launcher state.
@@ -207,11 +227,13 @@ impl Launcher {
                     workspace: selection,
                 },
                 profile: self.config.profile.clone(),
+                agent_label: self.config.agent_label.clone(),
                 no_multiplex: self.config.no_multiplex,
                 limits: std::mem::take(&mut self.config.limits),
                 herdr,
                 continuation: continuation.map(Box::new),
                 continuation_token: self.config.continuation_token.clone(),
+                replay_arguments: self.config.replay_arguments.clone(),
             }),
         };
         debug!("requesting launch preparation from daemon");
@@ -295,7 +317,8 @@ impl Launcher {
         Ok(LaunchHandoff {
             socket_path: self.config.socket_path.clone(),
             command: shell_words::join(words),
-            mount_arguments: self.config.mount_arguments.clone(),
+            mount_arguments: replay_mount_arguments(&self.config.replay_arguments),
+            replay_arguments: self.config.replay_arguments.clone(),
         })
     }
 
@@ -338,29 +361,9 @@ impl Launcher {
 
     fn exec_continuation(token: &str, continuation: LauncherContinuation) -> io::Result<()> {
         let executable = env::current_exe()?;
-        let mut arguments = vec![
-            OsString::from("launcher"),
-            OsString::from("--socket"),
-            continuation.socket_path.into_os_string(),
-            OsString::from("--profile"),
-            OsString::from(continuation.profile),
-            OsString::from("--command"),
-            OsString::from(continuation.command),
-            OsString::from("--continuation-token"),
-            OsString::from(token),
-        ];
-        for argument in continuation.mount_arguments {
-            arguments.push(OsString::from("--mount"));
-            arguments.push(OsString::from(argument));
-        }
-        match continuation.workspace {
-            WorkspaceSelection::Named(name) => {
-                arguments.push(OsString::from("--name"));
-                arguments.push(OsString::from(name.0));
-            }
-            WorkspaceSelection::Here => arguments.push(OsString::from("--no-worktree")),
-            WorkspaceSelection::Primary => {}
-        }
+        let arguments = continuation_arguments(token, continuation);
+        // The continuation carries normal resolved options, but keeps its original
+        // workspace routing rather than the durable replay's exact-directory mode.
         let error = Command::new(&executable).args(arguments).exec();
         Err(io::Error::new(
             error.kind(),
@@ -423,7 +426,7 @@ impl Launcher {
             })
             .transpose()?;
         let companion = reporting
-            .map(|_| create_omp_companion(&runtime))
+            .map(|_| create_agent_companion(&runtime, &self.config.command))
             .transpose()?;
         let runtime_kind = self.config.runtime.kind;
         let launch = LaunchSpec {
@@ -469,6 +472,60 @@ impl Launcher {
     }
 }
 
+fn continuation_arguments(token: &str, continuation: LauncherContinuation) -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("launcher")];
+    if continuation.replay_arguments.is_empty() {
+        // Programmatic launchers may not opt into durable replay.
+        arguments.extend([
+            OsString::from("--socket"),
+            continuation.socket_path.into_os_string(),
+            OsString::from("--profile"),
+            OsString::from(continuation.profile),
+            OsString::from("--herdr-agent"),
+            OsString::from(continuation.agent_label),
+            OsString::from("--command"),
+            OsString::from(continuation.command),
+        ]);
+        for mount in continuation.mount_arguments {
+            arguments.extend([OsString::from("--mount"), OsString::from(mount)]);
+        }
+    } else {
+        let mut replay = continuation.replay_arguments.into_iter();
+        while let Some(option) = replay.next() {
+            if option == "--here" || option == "--no-worktree" {
+                continue;
+            }
+            if option == "--herdr-agent" {
+                replay.next();
+                continue;
+            }
+            let takes_value = option != "--verbose";
+            arguments.push(OsString::from(option));
+            // Only remove switches in option positions, never a command or grant
+            // value which happens to have the same spelling.
+            if takes_value && let Some(value) = replay.next() {
+                arguments.push(OsString::from(value));
+            }
+        }
+        arguments.extend([
+            OsString::from("--herdr-agent"),
+            OsString::from(continuation.agent_label),
+        ]);
+    }
+    arguments.extend([
+        OsString::from("--continuation-token"),
+        OsString::from(token),
+    ]);
+    match continuation.workspace {
+        WorkspaceSelection::Named(name) => {
+            arguments.extend([OsString::from("--name"), OsString::from(name.0)]);
+        }
+        WorkspaceSelection::Here => arguments.push(OsString::from("--no-worktree")),
+        WorkspaceSelection::Primary => {}
+    }
+    arguments
+}
+
 fn execute_runtime(launch: &LaunchSpec, prepared: &crate::model::PreparedExec) -> io::Result<()> {
     if launch.runtime.network == NetworkMode::Private {
         let status = super::network::run(prepared, &launch.command)?;
@@ -500,10 +557,36 @@ fn execute_runtime(launch: &LaunchSpec, prepared: &crate::model::PreparedExec) -
     Err(io::Error::new(error.kind(), message))
 }
 
-fn create_omp_companion(runtime: &RuntimePolicy) -> io::Result<(File, PathBuf)> {
-    let destination = omp_extension_destination(runtime)?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompanionEngine {
+    Pi,
+    Omp,
+}
+
+fn companion_engine(command: &ForegroundCommand) -> CompanionEngine {
+    match command
+        .executable
+        .file_name()
+        .and_then(|name| name.to_str())
+    {
+        Some("pi") => CompanionEngine::Pi,
+        // Other commands retain the OMP activity companion, without session authority.
+        _ => CompanionEngine::Omp,
+    }
+}
+
+fn create_agent_companion(
+    runtime: &RuntimePolicy,
+    command: &ForegroundCommand,
+) -> io::Result<(File, PathBuf)> {
+    let engine = companion_engine(command);
+    let destination = extension_destination(runtime, engine)?;
+    let source = match engine {
+        CompanionEngine::Pi => include_str!("../../assets/pi/runroom-agent-state.ts"),
+        CompanionEngine::Omp => include_str!("../../assets/omp/runroom-agent-state.ts"),
+    };
     let file = sealed_runtime_file("runroom-agent-state.ts", |file| {
-        file.write_all(include_str!("../../assets/omp/runroom-agent-state.ts").as_bytes())
+        file.write_all(source.as_bytes())
     })?;
     Ok((file, destination))
 }
@@ -532,7 +615,7 @@ fn prepare_runtime(
                 let destination = destination.to_str().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "OMP extension destination is not valid UTF-8",
+                        "agent extension destination is not valid UTF-8",
                     )
                 })?;
                 prepare_bubblewrap(&[
@@ -625,7 +708,7 @@ fn projected_activity_socket(
         .map(|(_, destination, suffix)| destination.join(suffix)))
 }
 
-fn omp_extension_destination(runtime: &RuntimePolicy) -> io::Result<PathBuf> {
+fn extension_destination(runtime: &RuntimePolicy, engine: CompanionEngine) -> io::Result<PathBuf> {
     let projected = |name| {
         runtime
             .environment
@@ -642,11 +725,14 @@ fn omp_extension_destination(runtime: &RuntimePolicy) -> io::Result<PathBuf> {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "OMP companion requires a runtime HOME",
+                    "agent companion requires a runtime HOME",
                 )
             })?;
-        home.join(projected("PI_CONFIG_DIR").unwrap_or_else(|| Path::new(".omp")))
-            .join("agent")
+        let config_directory = match engine {
+            CompanionEngine::Pi => Path::new(".pi"),
+            CompanionEngine::Omp => projected("PI_CONFIG_DIR").unwrap_or_else(|| Path::new(".omp")),
+        };
+        home.join(config_directory).join("agent")
     };
     let destination = agent_directory.join("extensions/runroom-agent-state.ts");
     if !destination.is_absolute()
@@ -658,7 +744,7 @@ fn omp_extension_destination(runtime: &RuntimePolicy) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "OMP extension destination must be normalized, absolute, and contain no NUL: {}",
+                "agent extension destination must be normalized, absolute, and contain no NUL: {}",
                 destination.display()
             ),
         ));
@@ -689,6 +775,8 @@ struct LaunchDescriptor<'a> {
     herdr: DescriptorHerdr<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_socket: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_agent: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -819,6 +907,16 @@ fn create_launch_descriptor(
             pane_id,
         },
         activity_socket,
+        session_agent: match config
+            .command
+            .executable
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            Some("pi") => Some("pi"),
+            Some("omp") => Some("omp"),
+            _ => None,
+        },
     };
 
     debug!(
@@ -857,6 +955,129 @@ fn sealed_runtime_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_companion_uses_foreground_engine_and_projected_pi_directory() {
+        let mut runtime = reporting_runtime();
+        let pi = ForegroundCommand {
+            executable: "/opt/agents/pi".into(),
+            arguments: Vec::new(),
+        };
+        assert_eq!(companion_engine(&pi), CompanionEngine::Pi);
+        assert_eq!(
+            extension_destination(&runtime, companion_engine(&pi)).unwrap(),
+            Path::new("/home/sandbox/.pi/agent/extensions/runroom-agent-state.ts"),
+        );
+        runtime.environment.push(EnvironmentVariable {
+            name: "PI_CONFIG_DIR".into(),
+            value: ".custom-omp".into(),
+        });
+        assert_eq!(
+            extension_destination(&runtime, CompanionEngine::Pi).unwrap(),
+            Path::new("/home/sandbox/.pi/agent/extensions/runroom-agent-state.ts"),
+        );
+        runtime.environment.push(EnvironmentVariable {
+            name: "PI_CODING_AGENT_DIR".into(),
+            value: "/custom/pi-agent".into(),
+        });
+        assert_eq!(
+            extension_destination(&runtime, CompanionEngine::Pi).unwrap(),
+            Path::new("/custom/pi-agent/extensions/runroom-agent-state.ts"),
+        );
+        let omp = ForegroundCommand {
+            executable: "/opt/agents/omp".into(),
+            arguments: Vec::new(),
+        };
+        assert_eq!(companion_engine(&omp), CompanionEngine::Omp);
+    }
+
+    #[test]
+    fn live_continuation_retains_overrides_but_restores_original_workspace_routing() {
+        let continuation = LauncherContinuation {
+            socket_path: "/unused.sock".into(),
+            profile: "custom".to_owned(),
+            agent_label: "rr:pi".to_owned(),
+            command: "pi --model configured".to_owned(),
+            mount_arguments: Vec::new(),
+            workspace: WorkspaceSelection::Named(WorkspaceName("original".to_owned())),
+            replay_arguments: [
+                "--socket",
+                "/control.sock",
+                "--profile",
+                "custom",
+                "--herdr-agent",
+                "stale:pi",
+                "--network",
+                "private",
+                "--here",
+                "--no-worktree",
+                "--cpu-count",
+                "2",
+                "--mount",
+                "/host/grant@/grant:ro",
+                "--command",
+                "pi --model 'CLI model'",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        };
+        assert_eq!(
+            continuation_arguments("token", continuation),
+            [
+                "launcher",
+                "--socket",
+                "/control.sock",
+                "--profile",
+                "custom",
+                "--network",
+                "private",
+                "--cpu-count",
+                "2",
+                "--mount",
+                "/host/grant@/grant:ro",
+                "--command",
+                "pi --model 'CLI model'",
+                "--herdr-agent",
+                "rr:pi",
+                "--continuation-token",
+                "token",
+                "--name",
+                "original",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn programmatic_continuation_preserves_profile_and_frozen_agent_label() {
+        let continuation = LauncherContinuation {
+            socket_path: "/control.sock".into(),
+            profile: "coding".to_owned(),
+            agent_label: "rr:omp".to_owned(),
+            command: "omp --model 'configured model'".to_owned(),
+            mount_arguments: Vec::new(),
+            workspace: WorkspaceSelection::Here,
+            replay_arguments: Vec::new(),
+        };
+        assert_eq!(
+            continuation_arguments("token", continuation),
+            [
+                "launcher",
+                "--socket",
+                "/control.sock",
+                "--profile",
+                "coding",
+                "--herdr-agent",
+                "rr:omp",
+                "--command",
+                "omp --model 'configured model'",
+                "--continuation-token",
+                "token",
+                "--no-worktree",
+            ]
+            .map(OsString::from)
+        );
+    }
 
     #[test]
     fn project_environment_overrides_only_allowlisted_values() {
@@ -956,7 +1177,7 @@ mod tests {
     fn companion_uses_projected_agent_directory_configuration() {
         let mut runtime = reporting_runtime();
         assert_eq!(
-            omp_extension_destination(&runtime).unwrap(),
+            extension_destination(&runtime, CompanionEngine::Omp).unwrap(),
             Path::new("/home/sandbox/.omp/agent/extensions/runroom-agent-state.ts"),
         );
         runtime.environment.extend([
@@ -970,7 +1191,7 @@ mod tests {
             },
         ]);
         assert_eq!(
-            omp_extension_destination(&runtime).unwrap(),
+            extension_destination(&runtime, CompanionEngine::Omp).unwrap(),
             Path::new("/projected/home/.custom-omp/agent/extensions/runroom-agent-state.ts"),
         );
         runtime.environment.push(EnvironmentVariable {
@@ -978,7 +1199,7 @@ mod tests {
             value: "/custom/agent".into(),
         });
         assert_eq!(
-            omp_extension_destination(&runtime).unwrap(),
+            extension_destination(&runtime, CompanionEngine::Omp).unwrap(),
             Path::new("/custom/agent/extensions/runroom-agent-state.ts"),
         );
         runtime.environment.push(EnvironmentVariable {
@@ -986,7 +1207,7 @@ mod tests {
             value: "/last/agent".into(),
         });
         assert_eq!(
-            omp_extension_destination(&runtime).unwrap(),
+            extension_destination(&runtime, CompanionEngine::Omp).unwrap(),
             Path::new("/last/agent/extensions/runroom-agent-state.ts"),
         );
     }
@@ -1006,7 +1227,7 @@ mod tests {
                 value: directory.into(),
             });
             assert!(
-                omp_extension_destination(&runtime).is_err(),
+                extension_destination(&runtime, CompanionEngine::Omp).is_err(),
                 "{directory:?}"
             );
         }

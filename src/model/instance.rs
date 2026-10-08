@@ -27,6 +27,10 @@ pub struct InstanceRecord {
     pub scope_handle: String,
     pub workspace: ResolvedWorkspace,
     pub profile: String,
+    /// Frozen launcher-selected Herdr identity; activity reporters cannot override it.
+    pub agent_label: String,
+    /// Trusted resolved launcher arguments, never supplied by activity reporters.
+    pub replay_arguments: Vec<String>,
     pub limits: ResourceLimits,
     pub leader: ProcessId,
     pub state: InstanceState,
@@ -49,6 +53,22 @@ pub enum ActivityState {
 pub struct ActivityUpdate {
     pub state: ActivityState,
     pub message: Option<String>,
+    pub session: Option<AgentSession>,
+}
+
+/// Root coding-agent session reference reported from the supervised scope.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSession {
+    pub agent: SessionAgent,
+    pub reference: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionAgent {
+    Pi,
+    Omp,
 }
 
 /// Requested shutdown behavior for one supervised instance.

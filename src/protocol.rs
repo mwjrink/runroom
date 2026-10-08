@@ -13,6 +13,9 @@ use crate::model::{
 /// Application version shared by the CLI and the exact-match connection handshake.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Exact-match control wire revision, encoded in the frame magic.
+pub const CONTROL_WIRE_VERSION: u8 = 2;
+
 /// Request envelope accepted after a successful handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlRequest {
@@ -22,6 +25,7 @@ pub struct ControlRequest {
 
 /// Typed daemon operations; no generic host execution operation exists.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Bounded request metadata; avoid an allocation per launch.
 pub enum ControlOperation {
     PrepareLaunch(PrepareLaunchRequest),
     ResumeLaunch {

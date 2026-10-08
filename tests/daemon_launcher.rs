@@ -45,7 +45,7 @@ fn daemon_requires_the_exact_application_version_including_patch_and_suffixes() 
     ] {
         let mut stream = UnixStream::connect(&fixture.socket).expect("connect mismatch client");
         stream.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
-        let payload = [b"RRM\0\x01".as_slice(), version.as_bytes()].concat();
+        let payload = [b"RRM\x02\x01".as_slice(), version.as_bytes()].concat();
         stream
             .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
             .unwrap();
@@ -60,7 +60,7 @@ fn daemon_requires_the_exact_application_version_including_patch_and_suffixes() 
             .expect("read daemon rejection");
         assert_eq!(
             &hello[..6],
-            b"RRM\0\x02\x01",
+            b"RRM\x02\x02\x01",
             "accepted mismatched version {version}"
         );
         assert_eq!(&hello[6..], application_version.as_bytes());
@@ -997,11 +997,11 @@ fn same_pane_activity_probe() -> String {
     // daemon's real activity socket. Frames match src/process/daemon.rs.
     let reporter = r"import json,os,pathlib,socket,struct,sys
 state = int(sys.argv[1])
-message = sys.argv[2].encode('utf-8')
+message = json.dumps({'message': sys.argv[2]}).encode('utf-8')
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
     stream.settimeout(5)
     stream.connect('/runtime/runroom/activity/status.sock')
-    stream.sendall(b'RRA\0' + bytes([1, state]) + struct.pack('>H', len(message)) + message)
+    stream.sendall(b'RRA\0' + bytes([2, state]) + struct.pack('>H', len(message)) + message)
     ack = stream.recv(1)
     assert ack == b'\0', repr(ack)
 print(json.dumps(dict(pid=os.getpid(), cgroup=pathlib.Path('/proc/self/cgroup').read_text(), ack=list(ack))))
@@ -1102,8 +1102,8 @@ fn assert_scoped_pane_reports(
         assert_eq!(pane["pane"]["tab_id"], tab_id);
         assert_eq!(pane["pane"]["workspace_id"], workspace_id);
         assert_eq!(
-            pane["pane"]["agent"], record.profile,
-            "Herdr must attribute activity to the selected runtime profile"
+            pane["pane"]["agent"], record.agent_label,
+            "Herdr must attribute activity to the foreground agent, not its Runroom profile"
         );
         assert_pane_activity(herdr_socket, pane_id, state_name);
         let after = herdr_request(herdr_socket, "session.snapshot", &serde_json::json!({}));

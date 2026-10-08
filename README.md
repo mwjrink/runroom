@@ -2,6 +2,10 @@
 
 Run an app in a sandbox using bubblewrap and systemd to restrict files. This is little more than a command wrapper with a coordination daemon.
 
+## Philosophy
+
+In general, runroom is intended to be fairly transparent. Is not noticeably slower. It just wraps the harness (and agent within) without altering it. It just adds some guardrails without running a full container.
+
 ## Usecase
 
 Run agents/harnesses in a directory and give them read only access to other files. Limit their cpu cores (I set mine to the last physical cores to keep core 0-3 for ui responsiveness) & memory.
@@ -51,6 +55,31 @@ The template shares policy, environment, common mounts, and devices in the base;
 
 Mounting `~/.cargo/bin` exposes those files, not their external dependencies. Rustup-managed commands such as Cargo also need their Rust toolchain files; the binaries directory alone is insufficient.
 
+## Configuration stages
+
+Launcher policy and host-derived values are separate:
+
+1. `EffectiveLauncherConfig::merge` combines the selected profile/base settings and CLI overrides. `with_launch_mounts` adds parsed CLI grant declarations. This stage validates configuration syntax and policy without reading host environment values, looking up executables, checking source files, or discovering devices. Environment names, literal assignments, symbolic `~`/`@workspace` paths, optional mounts, and device selectors remain declarations.
+2. `EffectiveLauncherConfig::resolve` consumes that policy and produces `ResolvedLauncherConfig`: current host environment values, expanded/canonical mount sources, executable locations, concrete device grants, an absolute control socket, and canonical CLI mount arguments for replay.
+
+The boundary is explicit in `src/main.rs::launcher_mode`, before `effective.resolve(...)`. Neither stage contacts the daemon or creates a workspace/scope. Workspace selection/support mounts and project-environment application remain in the existing later launch phases.
+
+For example, `environment = ["PATH"]` is policy; today's host `PATH` value is resolution data. Changing that value does not change the effective configuration. A literal `set_environment.PATH` assignment is part of the effective policy.
+
+Base/profile mount precedence is preserved when symbolic and absolute destinations resolve to the same host path. An optional overriding grant still suppresses its base grant when its source is absent. `verify --offline` performs both stages; it skips only the daemon handshake, not host validation.
+
+### Resume configuration guard
+
+New launches record a versioned SHA-256 fingerprint of the effective policy in their replay arguments. Restores compare it before host resolution or daemon/workspace operations. A matching fingerprint resumes without a prompt.
+
+If the policy changed, Runroom warns and prints an editable normal `runroom --profile … --command '…' --here --no-worktree` command before offering **Resume anyway** or **Cancel**. Only `y` or `yes` proceeds; Enter, EOF, and other answers cancel. With non-interactive stdin or stderr, Runroom exits unsuccessfully after printing the command instead of waiting. Old replay arguments without a fingerprint also require confirmation. Runroom treats the entire harness command as opaque: it never interprets or removes harness resume selectors.
+
+The hash covers runtime/network policy, mount and device declarations, mirrored environment names, literal assignments, project-environment/identity policy, resource limits, and the agent label. It excludes host-derived values, the harness command/session reference, routing flags, socket, workspace name, verbosity, and launch-only mount grants already frozen into replay arguments. CLI overrides are applied before hashing, so replayed overrides still take precedence over changed file defaults.
+
+This detects policy changes, not changes to executables, mounted contents, discovered devices, or mirrored environment values. Accepting a mismatch uses the current configuration and records its fingerprint for subsequent restores; it does not restore a configuration snapshot.
+
+`runroom --help` ends with only the selected existing configuration file location, or `Configuration: none`. Selection uses `$XDG_CONFIG_HOME/runroom/config.toml`, falling back to `$HOME/.config/runroom/config.toml` when `XDG_CONFIG_HOME` is unset or invalid; help does not parse the file.
+
 ## Launch-only mounts
 
 ```sh
@@ -82,6 +111,8 @@ Select networking in a launcher profile:
 network = "private"
 ```
 
+`runroom --network host|none|private` overrides the selected profile for that launch, including Herdr pane routing and cold resume.
+
 | Mode | Host interfaces/listeners visible | Internet and LAN access |
 | --- | --- | --- |
 | `host` | Yes | Host routing and firewall apply |
@@ -94,29 +125,36 @@ The launcher owns Bubblewrap's startup gate. It starts slirp, waits for readines
 
 Networking helpers live only for their launch; named shared networks are not supported. Strict public-internet-only `outbound` networking remains a [future enhancement](ENHANCEMENTS.md#strict-outbound-networking).
 
-## OMP activity reporting
+## Herdr activity and conversation resume
 
-For identity-enabled Bubblewrap launches in Herdr, Runroom injects a read-only OMP companion extension and `/runtime/launch.json`. The companion reports UI session activity, approvals, questions, completion, and terminal failures through the restricted Runroom activity socket. Nested non-UI sessions do not report pane activity.
+For identity-enabled Bubblewrap launches in Herdr, Runroom injects a read-only Pi or OMP companion extension and `/runtime/launch.json`. The companion reports root interactive session activity, questions, completion, failures, and the current conversation file through the restricted Runroom activity socket. OMP additionally reports approvals. Nested/non-interactive sessions do not claim the pane.
 
-The profile must explicitly mount the daemon's activity directory read-only, for example `{ source = "~/.local/share/runroom/activity", destination = "/runtime/runroom", access = "ro" }` when that is the daemon socket's sibling activity directory. Runroom derives the sandbox socket path from that grant; it does not expose the host Herdr control socket or modify host OMP settings/extensions.
+The profile must explicitly mount the daemon's activity directory read-only, for example `{ source = "/run/user/1000/runroom/activity", destination = "/runtime/runroom", access = "ro" }` when that is the daemon socket's sibling activity directory. Runroom derives the sandbox socket path from that grant; it does not expose the host Herdr control socket or modify host agent settings/extensions.
 
-The injected extension has a stable, named canonical path so OMP can import it. Its sandbox-only parent directory is read-only; projected host extensions remain visible, and sibling OMP settings/authentication/session directories retain their configured persistence. Forwarded reports use the selected runtime profile as Herdr's agent label, taken from the daemon-owned instance record rather than supplied by the reporting process.
+The injected extension has a stable, named canonical path so the agent can import it. Its sandbox-only parent directory is read-only; projected host extensions remain visible, and sibling settings/authentication/session directories retain their configured persistence. Herdr's agent label defaults to the foreground executable's basename: profile `coding` running `omp` reports `omp`, not `coding`. This trusted label comes from the daemon-owned launch record, never from an activity reporter. The profile remains Runroom policy metadata; the foreground executable determines whether conversation resume uses Pi or OMP.
 
-After upgrading this reporting bridge, launch a fresh sandbox: restarting the daemon alone does not replace extensions already mounted inside running sandboxes.
+On launch, Runroom records the resolved control socket, profile, reporting label, command, network mode, CPU selection, CLI mount grants, and verbosity. The authenticated companion supplies only the current session reference; the daemon builds a durable Herdr `resume_argv` from the saved launch arguments. Switching conversations updates that reference. Pi reopens it with `--session`; OMP uses `--resume=`.
 
-## Client/daemon compatibility
+After a Herdr restart or reboot, Herdr restores the pane's host working directory and executes `runroom --restore-args …`. This internal, shell-safe replay uses `--here --no-worktree`, so it re-enters the saved directory without creating another worktree or pane. Existing conversation selectors are replaced with the reported reference; other command arguments and launch overrides remain intact.
 
-Client and daemon must have exactly the same full Cargo package version, including patch, prerelease, and build suffixes. This is the version printed by `runroom --version`. Rebuild/install both together and restart the daemon after upgrading.
+An optional `herdr_agent` overrides the full reporting label. It can be set in a profile or inherited from `launcher.base`; it does not change the command or selected profile:
 
-## Daemon executable discovery
-
-The user service searches `~/.local/bin` before `~/.cargo/bin`, then the standard system paths. Named Herdr sessions require a Herdr executable supporting `session list --json`. A daemon discovery failure includes the command's exit status and bounded stderr, so an older executable shadowing the current Herdr installation is visible.
-
-`just update` reinstalls the Runroom binary; it does not replace the installed systemd unit. Existing services with the old search path need a drop-in via `systemctl --user edit runroom.service`:
-
-```ini
-[Service]
-ExecSearchPath=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+```toml
+[launcher.profiles.coding]
+command = "omp"
+# Optional; omit to report "omp" and preserve stock Herdr resume compatibility.
+herdr_agent = "rr:omp"
 ```
 
-Then run `systemctl --user daemon-reload` and `systemctl --user restart runroom.service`.
+**Warning:** unmodified Herdr can discard the custom resume command when it detects a recognized agent whose canonical label differs from `herdr_agent`. For example, `rr:omp` conflicts with detected `omp` and can break cold resume. Keep the command-based default for transparent integration; no Herdr patch is required. The saved replay still contains `--profile coding`, independently of the displayed agent label.
+
+Requirements and limits:
+
+- Launch Pi/OMP directly as the foreground command, with `identity = "herdr"`. Arbitrary shell wrappers do not provide exact conversation replay.
+- Persist and remount the agent's session directory at the same sandbox path; session files must survive the reboot.
+- Enable Herdr's `[session] resume_agents_on_restore = true` (its default). Runroom and its daemon must be available when Herdr restores.
+- Profile configuration is reloaded, not snapshotted. Changing configuration between launch and resume is **undefined behavior**; keep the profile and grants stable.
+- Herdr's custom resume command limit is 8192 bytes, including the encoded replay. Oversized reports are rejected, not truncated.
+
+After upgrading this reporting bridge, restart the daemon and launch fresh sandboxes: restarting the daemon alone does not replace extensions already mounted inside running sandboxes. Already-open sessions without a recorded replay command are not retroactively resumable.
+

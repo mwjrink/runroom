@@ -23,9 +23,12 @@ pub struct LauncherContinuation {
     pub socket_path: PathBuf,
     pub workspace: super::WorkspaceSelection,
     pub profile: String,
+    pub agent_label: String,
     pub command: String,
     /// Normalized CLI-added mounts, reapplied by the routed launcher.
     pub mount_arguments: Vec<String>,
+    /// Resolved normal launcher arguments retained for durable replay.
+    pub replay_arguments: Vec<String>,
 }
 
 /// Handoff inputs not already supplied by the enclosing launch request.
@@ -34,6 +37,7 @@ pub struct LaunchHandoff {
     pub socket_path: PathBuf,
     pub command: String,
     pub mount_arguments: Vec<String>,
+    pub replay_arguments: Vec<String>,
 }
 
 /// Complete bounded metadata required to prepare and register one launch.
@@ -41,6 +45,10 @@ pub struct LaunchHandoff {
 pub struct PrepareLaunchRequest {
     pub workspace: LaunchRequest,
     pub profile: String,
+    /// Trusted Herdr identity, independent of the selected policy profile.
+    pub agent_label: String,
+    /// Empty for launches that cannot be durably replayed.
+    pub replay_arguments: Vec<String>,
     pub limits: ResourceLimits,
     /// Optional host pane identity, validated even when routing is disabled.
     pub herdr: Option<HerdrContext>,

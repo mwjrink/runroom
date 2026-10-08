@@ -1,4 +1,4 @@
-//! User configuration and command-line override resolution.
+//! Declarative launcher intent, host resolution, and daemon configuration.
 
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -13,9 +13,10 @@ use std::path::{Component, Path, PathBuf};
 
 use runroom::model::{
     BindAccess, BindMount, BindMountSource, DeviceMount, EnvironmentVariable, ForegroundCommand,
-    NetworkMode, ResourceLimits, RuntimeKind, RuntimePolicy, WorkspaceName,
+    NetworkMode, ResourceLimits, RuntimeKind, RuntimePolicy, WorkspaceName, valid_agent_label,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::debug;
 
 const CONFIG_DIRECTORY: &str = "runroom";
@@ -36,6 +37,9 @@ pub struct FileConfig {
     pub launcher: LauncherFileConfig,
     #[serde(default)]
     pub daemon: DaemonFileConfig,
+    /// Transient launch context, never part of the declarative policy.
+    #[serde(skip)]
+    no_worktree: bool,
 }
 
 impl FileConfig {
@@ -63,7 +67,29 @@ impl FileConfig {
         Ok(())
     }
 
-    /// Select the exact directory before validating the selected profile.
+    /// Apply the CLI network policy before normal runtime validation.
+    pub fn override_network(
+        &mut self,
+        profile_override: Option<&str>,
+        network: Option<NetworkFileMode>,
+    ) -> Result<(), SettingsError> {
+        let Some(network) = network else {
+            return Ok(());
+        };
+        let profile = profile_override
+            .or(self.launcher.profile.as_deref())
+            .unwrap_or("default");
+        validate_profile_name(profile)?;
+        let configured = self
+            .launcher
+            .profiles
+            .get_mut(profile)
+            .ok_or_else(|| SettingsError::UnknownProfile(profile.to_owned()))?;
+        configured.network = Some(network);
+        Ok(())
+    }
+
+    /// Select the exact directory without changing declarative profile policy.
     pub fn override_launch_mode(
         &mut self,
         profile_override: Option<&str>,
@@ -77,25 +103,11 @@ impl FileConfig {
             .or(self.launcher.profile.as_deref())
             .unwrap_or("default");
         validate_profile_name(profile)?;
-        let configured = self
-            .launcher
+        self.launcher
             .profiles
-            .get_mut(profile)
+            .get(profile)
             .ok_or_else(|| SettingsError::UnknownProfile(profile.to_owned()))?;
-        if self.runtime == Some(RuntimeFileKind::Bubblewrap) {
-            configured
-                .bind_mounts
-                .retain(|mount| !matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE));
-            configured.bind_mounts.insert(
-                0,
-                BindMountFileConfig {
-                    source: BindMountFileSource::Path(WORKSPACE_SOURCE.to_owned()),
-                    destination: Some(PathBuf::from("/workspace")),
-                    access: BindAccessFileMode::Rw,
-                    required: true,
-                },
-            );
-        }
+        self.no_worktree = true;
         Ok(())
     }
 }
@@ -130,12 +142,15 @@ pub struct LauncherFileConfig {
 #[serde(from = "RawProfileFileConfig")]
 pub struct ProfileFileConfig {
     pub command: Option<String>,
+    pub herdr_agent: Option<String>,
     pub project_environment: Option<bool>,
     pub network: Option<NetworkFileMode>,
     pub identity: Option<IdentityFileKind>,
     pub environment: Vec<String>,
     pub set_environment: BTreeMap<String, String>,
     pub bind_mounts: Vec<BindMountFileConfig>,
+    // Retained base entries form a prefix; host aliases may still be overridden by the child.
+    inherited_bind_mount_count: usize,
     pub devices: Vec<DeviceFileConfig>,
     pub memory_max_bytes: Option<u64>,
     pub tasks_max: Option<u64>,
@@ -180,6 +195,7 @@ impl TryFrom<RawLauncherFileConfig> for LauncherFileConfig {
 #[serde(deny_unknown_fields)]
 struct RawProfileFileConfig {
     command: Option<String>,
+    herdr_agent: Option<String>,
     project_environment: Option<bool>,
     network: Option<NetworkFileMode>,
     identity: Option<IdentityFileKind>,
@@ -198,12 +214,14 @@ impl From<RawProfileFileConfig> for ProfileFileConfig {
     fn from(raw: RawProfileFileConfig) -> Self {
         Self {
             command: raw.command,
+            herdr_agent: raw.herdr_agent,
             project_environment: raw.project_environment,
             network: raw.network,
             identity: raw.identity,
             environment: raw.environment.unwrap_or_default(),
             set_environment: raw.set_environment.unwrap_or_default(),
             bind_mounts: raw.bind_mounts.unwrap_or_default(),
+            inherited_bind_mount_count: 0,
             devices: raw.devices.unwrap_or_default(),
             memory_max_bytes: raw.memory_max_bytes,
             tasks_max: raw.tasks_max,
@@ -240,14 +258,22 @@ impl RawProfileFileConfig {
             }
         };
         let overrides_cpu = self.cpu_cores.is_some() || self.cpu_count.is_some();
+        let child_mount_count = self.bind_mounts.as_ref().map(Vec::len);
+        let bind_mounts = merge_keyed_entries(&base.bind_mounts, self.bind_mounts, bind_mount_key)?;
+        let inherited_bind_mount_count = match child_mount_count {
+            None => bind_mounts.len(),
+            Some(count) => bind_mounts.len() - count,
+        };
         Ok(ProfileFileConfig {
             command: self.command.or_else(|| base.command.clone()),
+            herdr_agent: self.herdr_agent.or_else(|| base.herdr_agent.clone()),
             project_environment: self.project_environment.or(base.project_environment),
             network: self.network.or(base.network),
             identity: self.identity.or(base.identity),
             environment,
             set_environment,
-            bind_mounts: merge_keyed_entries(&base.bind_mounts, self.bind_mounts, bind_mount_key)?,
+            bind_mounts,
+            inherited_bind_mount_count,
             devices: merge_keyed_entries(&base.devices, self.devices, |device| {
                 Ok(device.selector.clone())
             })?,
@@ -300,6 +326,23 @@ enum BindMountKey {
 
 fn bind_mount_key(mount: &BindMountFileConfig) -> Result<BindMountKey, SettingsError> {
     if let Some(destination) = &mount.destination {
+        return normalize_declarative_destination(destination.clone())
+            .map(BindMountKey::Destination);
+    }
+    match &mount.source {
+        BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE => {
+            Err(SettingsError::MissingWorkspaceDestination)
+        }
+        BindMountFileSource::Path(path) => {
+            validate_declarative_source(path)?;
+            normalize_declarative_destination(PathBuf::from(path)).map(BindMountKey::Destination)
+        }
+        BindMountFileSource::Executable(name) => Ok(BindMountKey::Executable(name.clone())),
+    }
+}
+
+fn resolved_bind_mount_key(mount: &BindMountFileConfig) -> Result<BindMountKey, SettingsError> {
+    if let Some(destination) = &mount.destination {
         return normalize_destination(destination.clone()).map(BindMountKey::Destination);
     }
     match &mount.source {
@@ -329,44 +372,10 @@ fn validate_base_profile(base: &ProfileFileConfig) -> Result<(), SettingsError> 
     if let Some(command) = &base.command {
         parse_command(command)?;
     }
-    validate_environment_allowlist(&base.environment)?;
-    for name in base.set_environment.keys() {
-        validate_environment_name(name)?;
+    if let Some(label) = &base.herdr_agent {
+        validate_agent_label(label)?;
     }
-    let mut destinations = Vec::with_capacity(base.bind_mounts.len());
-    let mut workspace_mounts = 0;
-    for mount in &base.bind_mounts {
-        match &mount.source {
-            BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE => {
-                if !mount.required {
-                    return Err(SettingsError::OptionalWorkspaceMount);
-                }
-                workspace_mounts += 1;
-            }
-            BindMountFileSource::Path(path) => {
-                expand_host_path(path)?;
-            }
-            BindMountFileSource::Executable(name) => validate_executable_name(name)?,
-        }
-        let key = bind_mount_key(mount)?;
-        if destinations.contains(&key) {
-            let destination = match key {
-                BindMountKey::Destination(path) => path,
-                BindMountKey::Executable(name) => Path::new("/opt/runroom/bin").join(name),
-            };
-            return Err(SettingsError::DuplicateBindDestination(destination));
-        }
-        destinations.push(key);
-    }
-    if workspace_mounts > 1 {
-        return Err(SettingsError::DuplicateWorkspaceMount);
-    }
-    for device in &base.devices {
-        match &device.selector {
-            DeviceSelector::Path(path) => validate_device_path(path)?,
-            DeviceSelector::Class(class) => validate_device_class(class)?,
-        }
-    }
+    validate_profile_declarations(base)?;
     validate_resource_limits(
         &ResourceLimits {
             memory_max_bytes: base.memory_max_bytes,
@@ -380,7 +389,78 @@ fn validate_base_profile(base: &ProfileFileConfig) -> Result<(), SettingsError> 
     )
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+fn validate_profile_declarations(base: &ProfileFileConfig) -> Result<(), SettingsError> {
+    validate_launch_declarations(base, false)
+}
+
+fn validate_launch_declarations(
+    base: &ProfileFileConfig,
+    no_worktree: bool,
+) -> Result<(), SettingsError> {
+    validate_environment_allowlist(&base.environment)?;
+    for name in base.set_environment.keys() {
+        validate_environment_name(name)?;
+    }
+    let mut destinations = Vec::with_capacity(base.bind_mounts.len());
+    if no_worktree {
+        destinations.push(BindMountKey::Destination(PathBuf::from("/workspace")));
+    }
+    let mut workspace_mounts = 0;
+    for mount in &base.bind_mounts {
+        match &mount.source {
+            BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE => {
+                if no_worktree {
+                    continue;
+                }
+                if !mount.required {
+                    return Err(SettingsError::OptionalWorkspaceMount);
+                }
+                workspace_mounts += 1;
+            }
+            BindMountFileSource::Path(path) => {
+                validate_declarative_source(path)?;
+            }
+            BindMountFileSource::Executable(name) => validate_executable_name(name)?,
+        }
+        let key = bind_mount_key(mount)?;
+        if destinations.contains(&key) {
+            let destination = match key {
+                BindMountKey::Destination(path) => path,
+                BindMountKey::Executable(name) => Path::new("/opt/runroom/bin").join(name),
+            };
+            return Err(SettingsError::DuplicateBindDestination(destination));
+        }
+        destinations.push(key);
+    }
+    let inherited_workspace_mounts = base.bind_mounts.iter()
+        .take(base.inherited_bind_mount_count)
+        .filter(|mount| matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE))
+        .count();
+    let symbolic_workspace_alias = base.inherited_bind_mount_count > 0
+        && base.bind_mounts.iter().any(|mount| {
+            matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE)
+                && mount
+                    .destination
+                    .as_ref()
+                    .is_some_and(|path| path.starts_with("~"))
+        });
+    if !no_worktree
+        && (inherited_workspace_mounts > 1
+            || workspace_mounts - inherited_workspace_mounts > 1
+            || workspace_mounts > 1 && !symbolic_workspace_alias)
+    {
+        return Err(SettingsError::DuplicateWorkspaceMount);
+    }
+    for device in &base.devices {
+        match &device.selector {
+            DeviceSelector::Path(path) => validate_device_path(path)?,
+            DeviceSelector::Class(class) => validate_device_class(class)?,
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkFileMode {
     #[default]
@@ -526,11 +606,49 @@ pub struct ResourceCeilingFileConfig {
     pub cpu_quota_basis_points: Option<u32>,
 }
 
+/// Complete launch intent, independent of the host on which it will run.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LauncherSettings {
+pub struct EffectiveLauncherConfig {
+    pub socket: Option<PathBuf>,
+    pub name: Option<WorkspaceName>,
+    pub profile: String,
+    pub agent_label: String,
+    pub command: ForegroundCommand,
+    pub runtime: EffectiveRuntimeConfig,
+    pub project_environment: bool,
+    pub environment_allowlist: Vec<String>,
+    pub identity: Option<IdentityFileKind>,
+    pub limits: ResourceLimits,
+    pub verbose: bool,
+    pub launch_mounts: Vec<LaunchMount>,
+    /// Exact-directory routing context; excluded from the policy fingerprint.
+    no_worktree: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EffectiveRuntimeConfig {
+    pub kind: RuntimeKind,
+    pub network: NetworkMode,
+    inherited_bind_mount_count: usize,
+    pub bind_mounts: Vec<BindMountFileConfig>,
+    pub devices: Vec<DeviceFileConfig>,
+    pub set_environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchMount {
+    pub source: PathBuf,
+    /// None means the read-only shorthand's source basename.
+    pub destination: Option<PathBuf>,
+    pub access: BindAccess,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedLauncherConfig {
     pub socket: PathBuf,
     pub name: Option<WorkspaceName>,
     pub profile: String,
+    pub agent_label: String,
     pub command: ForegroundCommand,
     pub runtime: RuntimePolicy,
     pub project_environment: bool,
@@ -538,19 +656,20 @@ pub struct LauncherSettings {
     pub identity: Option<IdentityFileKind>,
     pub limits: ResourceLimits,
     pub verbose: bool,
+    pub mount_arguments: Vec<String>,
 }
 
-impl LauncherSettings {
-    #[tracing::instrument(level = "debug", skip_all, name = "resolve_launcher_settings")]
-    pub fn resolve(
+impl EffectiveLauncherConfig {
+    pub fn merge(
         socket_override: Option<PathBuf>,
         name_override: Option<String>,
         profile_override: Option<String>,
         command_override: Option<String>,
+        herdr_agent_override: Option<String>,
         verbose_override: bool,
         file: &FileConfig,
     ) -> Result<Self, SettingsError> {
-        let socket = resolve_socket(socket_override, file)?;
+        let socket = socket_override.or_else(|| file.socket.clone());
         let name = name_override
             .or_else(|| file.launcher.name.clone())
             .map(validate_workspace_name)
@@ -568,24 +687,24 @@ impl LauncherSettings {
             .or_else(|| profile_config.command.clone())
             .ok_or_else(|| SettingsError::MissingCommand(profile.clone()))
             .and_then(|command| parse_command(&command))?;
+        let agent_label = resolve_agent_label(
+            &command,
+            herdr_agent_override.or_else(|| profile_config.herdr_agent.clone()),
+        )?;
         let kind = file.runtime.unwrap_or_default().into();
-        let home = match kind {
-            RuntimeKind::Native => None,
-            RuntimeKind::Bubblewrap => Some(validate_bubblewrap_host()?),
-        };
         let network = resolve_network(kind, profile_config.network)?;
-        let bind_mounts = resolve_bind_mounts(profile_config, kind)?;
-        let devices = resolve_devices(profile_config, kind)?;
-        let mut environment = resolve_environment(profile_config)?;
+        let no_worktree = file.no_worktree && kind == RuntimeKind::Bubblewrap;
+        validate_launch_declarations(profile_config, no_worktree)?;
         if kind == RuntimeKind::Bubblewrap
-            && profile_config
-                .bind_mounts
-                .iter()
-                .any(|mount| matches!(mount.source, BindMountFileSource::Executable(_)))
+            && !no_worktree
+            && !profile_config.bind_mounts.iter().any(|mount|
+                matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE))
         {
-            prepend_executable_path(&mut environment);
+            return Err(SettingsError::MissingWorkspaceMount);
         }
-        let project_environment = profile_config.project_environment.unwrap_or(false);
+        if kind != RuntimeKind::Bubblewrap && !profile_config.devices.is_empty() {
+            return Err(SettingsError::DevicesRequireBubblewrap);
+        }
         let limits = ResourceLimits {
             memory_max_bytes: profile_config.memory_max_bytes,
             tasks_max: profile_config.tasks_max,
@@ -604,46 +723,375 @@ impl LauncherSettings {
             return Err(SettingsError::IdentityRequiresBubblewrap);
         }
         if identity.is_some()
-            && !bind_mounts.iter().any(|mount| {
-                mount.source == BindMountSource::Workspace
-                    && mount.destination == Path::new("/workspace")
+            && !no_worktree
+            && !profile_config.bind_mounts.iter().any(|mount| {
+                matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE)
+                    && bind_mount_key(mount).ok()
+                        == Some(BindMountKey::Destination(PathBuf::from("/workspace")))
             })
         {
             return Err(SettingsError::IdentityRequiresWorkspaceDestination);
         }
-        let verbose = verbose_override || file.launcher.verbose.unwrap_or(false);
-        debug!(
-            profile,
-            runtime = ?kind,
-            network = ?network,
-            executable = %command.executable.display(),
-            argument_count = command.arguments.len(),
-            bind_mount_count = bind_mounts.len(),
-            device_count = devices.len(),
-            environment_count = environment.len(),
-            project_environment,
-            "resolved launcher settings"
-        );
         Ok(Self {
             socket,
             name,
             profile,
+            agent_label,
             command,
-            runtime: RuntimePolicy {
+            runtime: EffectiveRuntimeConfig {
                 kind,
                 network,
-                bind_mounts,
-                devices,
-                environment,
-                home,
+                bind_mounts: profile_config.bind_mounts.clone(),
+                devices: profile_config.devices.clone(),
+                inherited_bind_mount_count: profile_config.inherited_bind_mount_count,
+                set_environment: profile_config.set_environment.clone(),
             },
-            project_environment,
+            project_environment: profile_config.project_environment.unwrap_or(false),
             environment_allowlist: profile_config.environment.clone(),
             identity,
             limits,
-            verbose,
+            verbose: verbose_override || file.launcher.verbose.unwrap_or(false),
+            launch_mounts: Vec::new(),
+            no_worktree,
         })
     }
+
+    /// Hash only declarative launch policy, before reading host paths or values.
+    ///
+    /// Version 1 uses explicit field tags and length-prefixed bytes, fixed-width
+    /// big-endian integers, and presence markers. Collection order is retained;
+    /// literal environment assignments are ordered by their `BTreeMap` keys.
+    pub fn fingerprint(&self) -> Result<String, Box<dyn Error>> {
+        use std::fmt::Write as _;
+        let mut policy = PolicyFingerprint(Sha256::new());
+        policy.bytes(b"runroom-launch-policy-v1");
+        policy.bytes(b"runtime");
+        policy.bytes(match self.runtime.kind {
+            RuntimeKind::Native => b"native",
+            RuntimeKind::Bubblewrap => b"bubblewrap",
+        });
+        policy.bytes(b"network");
+        policy.bytes(match self.runtime.network {
+            NetworkMode::None => b"none",
+            NetworkMode::Host => b"host",
+            NetworkMode::Private => b"private",
+        });
+        policy.bytes(b"bind_mounts");
+        policy.number(self.runtime.bind_mounts.len() as u64);
+        for (index, mount) in self.runtime.bind_mounts.iter().enumerate() {
+            policy.flag(index < self.runtime.inherited_bind_mount_count);
+            match &mount.source {
+                BindMountFileSource::Path(path) => {
+                    policy.bytes(b"path");
+                    policy.bytes(path.as_bytes());
+                }
+                BindMountFileSource::Executable(name) => {
+                    policy.bytes(b"executable");
+                    policy.bytes(name.as_bytes());
+                }
+            }
+            policy.flag(mount.destination.is_some());
+            if let Some(destination) = &mount.destination {
+                policy.bytes(destination.as_os_str().as_bytes());
+            }
+            policy.bytes(match mount.access {
+                BindAccessFileMode::Ro => b"ro",
+                BindAccessFileMode::Rw => b"rw",
+            });
+            policy.flag(mount.required);
+        }
+        policy.bytes(b"devices");
+        policy.number(self.runtime.devices.len() as u64);
+        for device in &self.runtime.devices {
+            match &device.selector {
+                DeviceSelector::Path(path) => {
+                    policy.bytes(b"path");
+                    policy.bytes(path.as_os_str().as_bytes());
+                }
+                DeviceSelector::Class(class) => {
+                    policy.bytes(b"class");
+                    policy.bytes(class.as_bytes());
+                }
+            }
+            policy.flag(device.required);
+        }
+        policy.bytes(b"environment_names");
+        policy.number(self.environment_allowlist.len() as u64);
+        for name in &self.environment_allowlist {
+            policy.bytes(name.as_bytes());
+        }
+        policy.bytes(b"literal_environment");
+        policy.number(self.runtime.set_environment.len() as u64);
+        for (name, value) in &self.runtime.set_environment {
+            policy.bytes(name.as_bytes());
+            policy.bytes(value.as_bytes());
+        }
+        policy.bytes(b"project_environment");
+        policy.flag(self.project_environment);
+        policy.bytes(b"identity");
+        policy.bytes(match self.identity {
+            None => b"none",
+            Some(IdentityFileKind::Herdr) => b"herdr",
+        });
+        policy.bytes(b"memory_max_bytes");
+        policy.optional_number(self.limits.memory_max_bytes);
+        policy.bytes(b"tasks_max");
+        policy.optional_number(self.limits.tasks_max);
+        policy.bytes(b"cpu_quota_basis_points");
+        policy.optional_number(self.limits.cpu_quota_basis_points.map(u64::from));
+        policy.bytes(b"cpu_cores");
+        policy.flag(self.limits.cpu_cores.is_some());
+        if let Some(cores) = &self.limits.cpu_cores {
+            policy.number(cores.len() as u64);
+            for core in cores {
+                policy.number(u64::from(*core));
+            }
+        }
+        policy.bytes(b"cpu_count");
+        policy.optional_number(self.limits.cpu_count.map(u64::from));
+        policy.bytes(b"agent_label");
+        policy.bytes(self.agent_label.as_bytes());
+
+        let mut fingerprint = String::with_capacity(67);
+        fingerprint.push_str("v1:");
+        for byte in policy.0.finalize() {
+            write!(fingerprint, "{byte:02x}")?;
+        }
+        Ok(fingerprint)
+    }
+
+    pub fn with_launch_mounts(
+        mut self,
+        read_only: Vec<PathBuf>,
+        specifications: Vec<String>,
+    ) -> Result<Self, Box<dyn Error>> {
+        if read_only.is_empty() && specifications.is_empty() {
+            return Ok(self);
+        }
+        if self.runtime.kind != RuntimeKind::Bubblewrap {
+            return Err("launch mount flags require the bubblewrap runtime".into());
+        }
+        if self.launch_mounts.len() + read_only.len() + specifications.len() > 128 {
+            return Err("at most 128 launch mounts are allowed".into());
+        }
+        for source in read_only {
+            if source.file_name().is_none() {
+                return Err(
+                    "read-only mount source needs a basename; use --mount SOURCE@DEST:ro".into(),
+                );
+            }
+            self.launch_mounts.push(LaunchMount {
+                source,
+                destination: None,
+                access: BindAccess::ReadOnly,
+            });
+        }
+        for specification in specifications {
+            let (paths, mode) = specification
+                .rsplit_once(':')
+                .ok_or("mount must use SOURCE@DEST:ro|rw")?;
+            let access = match mode {
+                "ro" => BindAccess::ReadOnly,
+                "rw" => BindAccess::ReadWrite,
+                _ => return Err("mount access must be ro or rw".into()),
+            };
+            let (source, destination) = paths
+                .rsplit_once('@')
+                .filter(|(source, destination)| !source.is_empty() && !destination.is_empty())
+                .ok_or("mount must use SOURCE@DEST:ro|rw")?;
+            self.launch_mounts.push(LaunchMount {
+                source: PathBuf::from(source),
+                destination: Some(normalize_declarative_destination(PathBuf::from(
+                    destination,
+                ))?),
+                access,
+            });
+        }
+        let mut destinations = self
+            .runtime
+            .bind_mounts
+            .iter()
+            .filter(|mount| !self.no_worktree
+                || !matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE))
+            .map(bind_mount_key)
+            .collect::<Result<Vec<_>, _>>()?;
+        if self.no_worktree {
+            destinations.push(BindMountKey::Destination(PathBuf::from("/workspace")));
+        }
+        for mount in &self.launch_mounts {
+            let destination = match &mount.destination {
+                Some(destination) => destination.clone(),
+                None if mount.source == Path::new("~") => continue,
+                None => Path::new("/").join(mount.source.file_name().ok_or(
+                    "read-only mount source needs a basename; use --mount SOURCE@DEST:ro",
+                )?),
+            };
+            let destination = normalize_declarative_destination(destination)?;
+            let text = destination
+                .to_str()
+                .ok_or("launch mount destination must be valid UTF-8")?;
+            if text.contains('@') {
+                return Err("launch mount destination cannot contain @".into());
+            }
+            let key = BindMountKey::Destination(destination.clone());
+            if destinations.contains(&key) {
+                return Err(SettingsError::DuplicateBindDestination(destination).into());
+            }
+            destinations.push(key);
+        }
+        Ok(self)
+    }
+
+    pub fn resolve(
+        self,
+        current_directory: &Path,
+    ) -> Result<ResolvedLauncherConfig, Box<dyn Error>> {
+        let socket = match self.socket {
+            Some(socket) => expand_user_path(socket)?,
+            None => default_socket_path().map_err(SettingsError::DefaultSocket)?,
+        };
+        let socket = current_directory.join(socket);
+        let kind = self.runtime.kind;
+        let home = match kind {
+            RuntimeKind::Native => None,
+            RuntimeKind::Bubblewrap => Some(validate_bubblewrap_host()?),
+        };
+        let mut profile_config = ProfileFileConfig {
+            environment: self.environment_allowlist,
+            set_environment: self.runtime.set_environment,
+            bind_mounts: self.runtime.bind_mounts,
+            devices: self.runtime.devices,
+            inherited_bind_mount_count: self.runtime.inherited_bind_mount_count,
+            ..ProfileFileConfig::default()
+        };
+        if self.no_worktree {
+            rewrite_workspace_binding(&mut profile_config);
+        }
+        let bind_mounts = resolve_bind_mounts(&profile_config, kind)?;
+        let devices = resolve_devices(&profile_config, kind)?;
+        let mut environment = resolve_environment(&profile_config)?;
+        if kind == RuntimeKind::Bubblewrap
+            && profile_config
+                .bind_mounts
+                .iter()
+                .any(|mount| matches!(mount.source, BindMountFileSource::Executable(_)))
+        {
+            prepend_executable_path(&mut environment);
+        }
+        let mut runtime = RuntimePolicy {
+            kind,
+            network: self.runtime.network,
+            bind_mounts,
+            devices,
+            environment,
+            home,
+        };
+        let mut mount_arguments = Vec::with_capacity(self.launch_mounts.len());
+        for mount in self.launch_mounts {
+            let source = resolve_launch_source(&mount.source, current_directory)?;
+            let destination = if let Some(destination) = mount.destination {
+                destination
+            } else {
+                let expanded = expand_user_path(mount.source)?;
+                let name = expanded
+                    .file_name()
+                    .ok_or("read-only mount source needs a basename; use --mount SOURCE@DEST:ro")?;
+                Path::new("/").join(name)
+            };
+            append_launch_mount(
+                &mut runtime,
+                source,
+                destination,
+                mount.access,
+                &mut mount_arguments,
+            )?;
+        }
+        debug!(profile = self.profile, runtime = ?kind, "resolved launcher config");
+        Ok(ResolvedLauncherConfig {
+            socket,
+            name: self.name,
+            profile: self.profile,
+            agent_label: self.agent_label,
+            command: self.command,
+            runtime,
+            project_environment: self.project_environment,
+            environment_allowlist: profile_config.environment,
+            identity: self.identity,
+            limits: self.limits,
+            verbose: self.verbose,
+            mount_arguments,
+        })
+    }
+}
+
+/// Streaming, unambiguous encoding; no host resolution or serialization buffer.
+struct PolicyFingerprint(Sha256);
+
+impl PolicyFingerprint {
+    fn bytes(&mut self, value: &[u8]) {
+        self.number(value.len() as u64);
+        self.0.update(value);
+    }
+
+    fn number(&mut self, value: u64) {
+        self.0.update(value.to_be_bytes());
+    }
+
+    fn flag(&mut self, value: bool) {
+        self.0.update([u8::from(value)]);
+    }
+
+    fn optional_number(&mut self, value: Option<u64>) {
+        self.flag(value.is_some());
+        if let Some(value) = value {
+            self.number(value);
+        }
+    }
+}
+
+/// Resolve exact-directory routing without altering the saved declared policy.
+fn rewrite_workspace_binding(profile: &mut ProfileFileConfig) {
+    profile.inherited_bind_mount_count = profile.bind_mounts.iter()
+        .take(profile.inherited_bind_mount_count)
+        .filter(|mount| !matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE))
+        .count() + 1;
+    profile.bind_mounts.retain(|mount| {
+        !matches!(&mount.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE)
+    });
+    profile.bind_mounts.insert(
+        0,
+        BindMountFileConfig {
+            source: BindMountFileSource::Path(WORKSPACE_SOURCE.to_owned()),
+            destination: Some(PathBuf::from("/workspace")),
+            access: BindAccessFileMode::Rw,
+            required: true,
+        },
+    );
+}
+
+fn validate_agent_label(label: &str) -> Result<(), SettingsError> {
+    if valid_agent_label(label) {
+        Ok(())
+    } else {
+        Err(SettingsError::InvalidAgentLabel(label.to_owned()))
+    }
+}
+
+fn resolve_agent_label(
+    command: &ForegroundCommand,
+    override_label: Option<String>,
+) -> Result<String, SettingsError> {
+    let label = override_label
+        .or_else(|| {
+            command
+                .executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| SettingsError::InvalidAgentLabel(String::new()))?;
+    validate_agent_label(&label)?;
+    Ok(label)
 }
 
 fn resolve_network(
@@ -740,7 +1188,9 @@ pub fn load_path(path: &Path) -> Result<FileConfig, ConfigError> {
     })
 }
 
-pub fn validate_all_profiles(file: &FileConfig) -> Result<Vec<LauncherSettings>, SettingsError> {
+pub fn validate_all_profiles(
+    file: &FileConfig,
+) -> Result<Vec<EffectiveLauncherConfig>, SettingsError> {
     if file.launcher.profiles.is_empty() {
         return Err(SettingsError::NoProfiles);
     }
@@ -748,7 +1198,15 @@ pub fn validate_all_profiles(file: &FileConfig) -> Result<Vec<LauncherSettings>,
         .profiles
         .keys()
         .map(|profile| {
-            LauncherSettings::resolve(None, None, Some(profile.clone()), None, false, file)
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                Some(profile.clone()),
+                None,
+                None,
+                false,
+                file,
+            )
         })
         .collect()
 }
@@ -827,58 +1285,6 @@ fn validate_environment_name(name: &str) -> Result<(), SettingsError> {
     Ok(())
 }
 
-/// Merge CLI grants into this launch only, retaining absolute arguments for pane routing.
-pub fn apply_launch_mounts(
-    runtime: &mut RuntimePolicy,
-    read_only: &[PathBuf],
-    specifications: &[String],
-    current_directory: &Path,
-) -> Result<Vec<String>, Box<dyn Error>> {
-    if read_only.is_empty() && specifications.is_empty() {
-        return Ok(Vec::new());
-    }
-    if runtime.kind != RuntimeKind::Bubblewrap {
-        return Err("launch mount flags require the bubblewrap runtime".into());
-    }
-    if read_only.len() + specifications.len() > 128 {
-        return Err("at most 128 launch mounts are allowed".into());
-    }
-    let mut arguments = Vec::with_capacity(read_only.len() + specifications.len());
-    for path in read_only {
-        let source = resolve_launch_source(path, current_directory)?;
-        let expanded = expand_user_path(path.clone())?;
-        let name = expanded
-            .file_name()
-            .ok_or("read-only mount source needs a basename; use --mount SOURCE@DEST:ro")?;
-        let destination = Path::new("/").join(name);
-        append_launch_mount(
-            runtime,
-            source,
-            destination,
-            BindAccess::ReadOnly,
-            &mut arguments,
-        )?;
-    }
-    for specification in specifications {
-        let (paths, mode) = specification
-            .rsplit_once(':')
-            .ok_or("mount must use SOURCE@DEST:ro|rw")?;
-        let access = match mode {
-            "ro" => BindAccess::ReadOnly,
-            "rw" => BindAccess::ReadWrite,
-            _ => return Err("mount access must be ro or rw".into()),
-        };
-        let (source, destination) = paths
-            .rsplit_once('@')
-            .filter(|(source, destination)| !source.is_empty() && !destination.is_empty())
-            .ok_or("mount must use SOURCE@DEST:ro|rw")?;
-        let source = resolve_launch_source(Path::new(source), current_directory)?;
-        let destination = normalize_destination(PathBuf::from(destination))?;
-        append_launch_mount(runtime, source, destination, access, &mut arguments)?;
-    }
-    Ok(arguments)
-}
-
 fn resolve_launch_source(path: &Path, current_directory: &Path) -> Result<PathBuf, SettingsError> {
     let expanded = expand_user_path(path.to_owned())?;
     let absolute = current_directory.join(expanded);
@@ -932,7 +1338,25 @@ fn resolve_bind_mounts(
     let mut mounts = Vec::with_capacity(profile.bind_mounts.len());
     let mut destinations = HashSet::with_capacity(profile.bind_mounts.len());
     let mut workspace_mounts = 0;
-    for configured in &profile.bind_mounts {
+    // Resolve layer keys before touching sources: an absent optional child still
+    // revokes its base grant, and an overridden required base need not exist.
+    let child_keys = if profile.inherited_bind_mount_count > 0 {
+        profile
+            .bind_mounts
+            .iter()
+            .skip(profile.inherited_bind_mount_count)
+            .map(resolved_bind_mount_key)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    for (index, configured) in profile.bind_mounts.iter().enumerate() {
+        if index < profile.inherited_bind_mount_count
+            && !child_keys.is_empty()
+            && child_keys.contains(&resolved_bind_mount_key(configured)?)
+        {
+            continue;
+        }
         let (source, default_destination) = if matches!(&configured.source, BindMountFileSource::Path(path) if path == WORKSPACE_SOURCE)
         {
             if !configured.required {
@@ -1348,7 +1772,30 @@ fn expand_host_path(source: &str) -> Result<PathBuf, SettingsError> {
 }
 
 fn normalize_destination(destination: PathBuf) -> Result<PathBuf, SettingsError> {
-    let destination = expand_user_path(destination)?;
+    normalize_declarative_destination(expand_user_path(destination)?)
+}
+
+fn validate_declarative_source(source: &str) -> Result<(), SettingsError> {
+    let path = Path::new(source);
+    if path.is_absolute() || path.starts_with("~") {
+        Ok(())
+    } else {
+        Err(SettingsError::RelativeBindSource(path.to_owned()))
+    }
+}
+
+fn normalize_declarative_destination(destination: PathBuf) -> Result<PathBuf, SettingsError> {
+    // HOME remains symbolic until host resolution.
+    if let Ok(relative) = destination.strip_prefix("~") {
+        if destination.as_os_str().as_bytes().contains(&0)
+            || relative
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(SettingsError::InvalidBindDestination(destination));
+        }
+        return Ok(destination);
+    }
     if !destination.is_absolute() {
         return Err(SettingsError::InvalidBindDestination(destination));
     }
@@ -1409,6 +1856,11 @@ fn default_config_path() -> Option<PathBuf> {
     absolute_environment_path("XDG_CONFIG_HOME")
         .or_else(|| absolute_environment_path("HOME").map(|home| home.join(".config")))
         .map(|directory| directory.join(CONFIG_DIRECTORY).join(CONFIG_FILE))
+}
+
+/// Existing selected configuration file, using the same lookup as `load_default`.
+pub fn selected_config_path() -> Option<PathBuf> {
+    default_config_path().filter(|path| path.is_file())
 }
 
 fn default_socket_path() -> io::Result<PathBuf> {
@@ -1562,6 +2014,7 @@ pub enum SettingsError {
     NoProfiles,
     AbstractProfile,
     InvalidProfileName,
+    InvalidAgentLabel(String),
     UnknownProfile(String),
     MissingCommand(String),
     EmptyCommand,
@@ -1612,6 +2065,10 @@ impl Display for SettingsError {
                 formatter.write_str("launcher profile 'base' is abstract and cannot be selected")
             }
             Self::InvalidProfileName => formatter.write_str("launcher profile must not be empty"),
+            Self::InvalidAgentLabel(label) => write!(
+                formatter,
+                "invalid Herdr agent label {label:?}: must contain 1..=512 bytes and no control characters",
+            ),
             Self::NoProfiles => formatter.write_str("no launcher profiles are configured"),
             Self::UnknownProfile(profile) => {
                 write!(formatter, "launcher profile is not configured: {profile}")
@@ -1773,6 +2230,7 @@ impl Error for SettingsError {
             Self::InvalidWorkspaceName
             | Self::AbstractProfile
             | Self::InvalidProfileName
+            | Self::InvalidAgentLabel(_)
             | Self::UnknownProfile(_)
             | Self::NoProfiles
             | Self::MissingCommand(_)
@@ -1821,12 +2279,14 @@ mod tests {
     fn profile(command: Option<&str>) -> ProfileFileConfig {
         ProfileFileConfig {
             command: command.map(str::to_owned),
+            herdr_agent: None,
             project_environment: None,
             network: Some(NetworkFileMode::Host),
             identity: None,
             environment: Vec::new(),
             set_environment: BTreeMap::new(),
             bind_mounts: Vec::new(),
+            inherited_bind_mount_count: 0,
             devices: Vec::new(),
             memory_max_bytes: None,
             tasks_max: None,
@@ -1834,6 +2294,143 @@ mod tests {
             cpu_cores: None,
             cpu_count: None,
         }
+    }
+
+    #[test]
+    fn agent_label_defaults_to_selected_command_basename_not_profile() {
+        let file: FileConfig = toml::from_str(
+            r#"
+socket = "/unused.sock"
+[launcher]
+profile = "coding"
+[launcher.profiles.coding]
+command = "/opt/agents/omp --model configured"
+"#,
+        )
+        .unwrap();
+        let settings =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        assert_eq!(settings.profile, "coding");
+        assert_eq!(settings.agent_label, "omp");
+        assert_eq!(settings.command.executable, Path::new("/opt/agents/omp"));
+        assert_eq!(
+            settings.command.arguments,
+            ["--model", "configured"].map(OsString::from)
+        );
+
+        let overridden = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            None,
+            Some("/other/bin/pi --model cli".to_owned()),
+            None,
+            false,
+            &file,
+        )
+        .unwrap();
+        assert_eq!(overridden.profile, "coding");
+        assert_eq!(overridden.agent_label, "pi");
+        assert_eq!(overridden.command.executable, Path::new("/other/bin/pi"));
+    }
+
+    #[test]
+    fn agent_label_inherits_base_and_yields_to_profile_and_replay_overrides() {
+        let file: FileConfig = toml::from_str(
+            r#"
+socket = "/unused.sock"
+[launcher]
+profile = "coding"
+[launcher.base]
+command = "omp"
+herdr_agent = "rr:omp"
+[launcher.profiles.coding]
+[launcher.profiles.custom]
+herdr_agent = "team:omp"
+"#,
+        )
+        .unwrap();
+        let inherited =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        assert_eq!(inherited.agent_label, "rr:omp");
+        assert_eq!(inherited.profile, "coding");
+        assert_eq!(inherited.command.executable, Path::new("omp"));
+
+        let custom = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            Some("custom".to_owned()),
+            Some("pi".to_owned()),
+            None,
+            false,
+            &file,
+        )
+        .unwrap();
+        assert_eq!(custom.agent_label, "team:omp");
+        assert_eq!(custom.profile, "custom");
+        assert_eq!(custom.command.executable, Path::new("pi"));
+
+        let frozen = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            None,
+            None,
+            Some("omp".to_owned()),
+            false,
+            &file,
+        )
+        .unwrap();
+        assert_eq!(frozen.agent_label, "omp");
+        assert_eq!(frozen.profile, "coding");
+    }
+
+    #[test]
+    fn agent_label_rejects_invalid_config_and_replay_labels() {
+        let mut file: FileConfig =
+            toml::from_str("socket = '/unused.sock'\n[launcher.profiles.default]\ncommand = 'omp'")
+                .unwrap();
+        for label in [
+            String::new(),
+            "x".repeat(513),
+            "omp\n".to_owned(),
+            "rr:\0omp".to_owned(),
+            "rr:\u{0085}omp".to_owned(),
+        ] {
+            file.launcher
+                .profiles
+                .get_mut("default")
+                .unwrap()
+                .herdr_agent = Some(label.clone());
+            assert!(matches!(
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
+                Err(SettingsError::InvalidAgentLabel(rejected)) if rejected == label
+            ));
+            file.launcher
+                .profiles
+                .get_mut("default")
+                .unwrap()
+                .herdr_agent = None;
+            assert!(matches!(
+                EffectiveLauncherConfig::merge(None, None, None, None, Some(label.clone()), false, &file),
+                Err(SettingsError::InvalidAgentLabel(rejected)) if rejected == label
+            ));
+            let base = format!(
+                "[launcher.base]\ncommand = 'omp'\nherdr_agent = {}\n[launcher.profiles.default]",
+                serde_json::to_string(&label).unwrap()
+            );
+            assert!(toml::from_str::<FileConfig>(&base).is_err());
+        }
+        file.launcher
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .herdr_agent = Some("é".repeat(256));
+        assert_eq!(
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+                .unwrap()
+                .agent_label
+                .len(),
+            512
+        );
     }
 
     #[test]
@@ -1989,30 +2586,6 @@ devices = []
     }
 
     #[test]
-    fn expanded_implicit_path_mounts_are_replaced_by_effective_destination() {
-        let home = absolute_environment_path("HOME").expect("absolute test home");
-        let mut file: FileConfig = toml::from_str(
-            r#"
-[launcher.base]
-bind_mounts = [{ source = "~/.config/tool", access = "ro" }]
-[launcher.profiles.default]
-"#,
-        )
-        .unwrap();
-        let raw: RawProfileFileConfig = toml::from_str(
-            r#"bind_mounts = [{ source = "/replacement", destination = "~/.config/tool", access = "rw" }]"#,
-        ).unwrap();
-        let inherited = file.launcher.profiles.remove("default").unwrap();
-        let merged = raw.inherit(&inherited).unwrap();
-        assert_eq!(merged.bind_mounts.len(), 1);
-        assert_eq!(merged.bind_mounts[0].access, BindAccessFileMode::Rw);
-        assert_eq!(
-            bind_mount_key(&merged.bind_mounts[0]).unwrap(),
-            BindMountKey::Destination(home.join(".config/tool"))
-        );
-    }
-
-    #[test]
     fn literal_assignments_override_inherited_host_environment() {
         let file: FileConfig = toml::from_str(
             r#"
@@ -2025,7 +2598,10 @@ set_environment = { PATH = "/child/bin", TERM = "child-terminal" }
 "#,
         )
         .unwrap();
-        let settings = LauncherSettings::resolve(None, None, None, None, false, &file).unwrap();
+        let settings = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+            .unwrap()
+            .resolve(Path::new("/"))
+            .unwrap();
         assert_eq!(
             settings.runtime.environment,
             [
@@ -2055,9 +2631,17 @@ command = "/bin/true"
         )
         .unwrap();
         let resolve = |file: &FileConfig, selected: Option<&str>| {
-            LauncherSettings::resolve(None, None, selected.map(str::to_owned), None, false, file)
-                .unwrap()
-                .profile
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                selected.map(str::to_owned),
+                None,
+                None,
+                false,
+                file,
+            )
+            .unwrap()
+            .profile
         };
         assert_eq!(resolve(&file, None), "default");
         file.launcher.profile = Some("configured".to_owned());
@@ -2066,8 +2650,48 @@ command = "/bin/true"
         file.launcher.profile = None;
         file.launcher.profiles.remove("default");
         assert!(matches!(
-            LauncherSettings::resolve(None, None, None, None, false, &file),
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
             Err(SettingsError::UnknownProfile(name)) if name == "default"
+        ));
+    }
+
+    #[test]
+    fn network_override_replaces_only_selected_profile_and_keeps_runtime_validation() {
+        let mut file: FileConfig = toml::from_str(
+            r#"
+socket = "/unused.sock"
+[launcher]
+profile = "selected"
+[launcher.base]
+command = "/bin/true"
+network = "host"
+[launcher.profiles.selected]
+[launcher.profiles.other]
+"#,
+        )
+        .unwrap();
+        file.override_network(None, Some(NetworkFileMode::None))
+            .unwrap();
+        let settings =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        assert_eq!(settings.runtime.network, NetworkMode::None);
+        assert_eq!(
+            file.launcher.profiles["other"].network,
+            Some(NetworkFileMode::Host)
+        );
+        file.override_network(Some("other"), Some(NetworkFileMode::Private))
+            .unwrap();
+        assert!(matches!(
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                Some("other".to_owned()),
+                None,
+                None,
+                false,
+                &file
+            ),
+            Err(SettingsError::PrivateNetworkRequiresBubblewrap)
         ));
     }
 
@@ -2086,7 +2710,15 @@ command = "/bin/true"
         )
         .unwrap();
         assert!(matches!(
-            LauncherSettings::resolve(None, None, Some("base".to_owned()), None, false, &file),
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                Some("base".to_owned()),
+                None,
+                None,
+                false,
+                &file
+            ),
             Err(SettingsError::AbstractProfile)
         ));
         assert!(matches!(
@@ -2099,7 +2731,7 @@ command = "/bin/true"
         ));
         file.launcher.profile = Some("base".to_owned());
         assert!(matches!(
-            LauncherSettings::resolve(None, None, None, None, false, &file),
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
             Err(SettingsError::AbstractProfile)
         ));
         file.launcher.profiles.remove("base");
@@ -2161,17 +2793,20 @@ command = "/bin/true"
                  [launcher.profiles.default]\n{child}\n[launcher.profiles.other]"
             ))
             .unwrap();
-            let settings = LauncherSettings::resolve(None, None, None, None, false, &file).unwrap();
+            let settings =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
             assert_eq!(settings.limits.cpu_cores, expected_cores);
             assert_eq!(settings.limits.cpu_count, expected_count);
             let other = file.launcher.profiles["other"].clone();
             file.override_cpu_selection(None, Some(vec![4, 7]), None)
                 .unwrap();
-            let settings = LauncherSettings::resolve(None, None, None, None, false, &file).unwrap();
+            let settings =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
             assert_eq!(settings.limits.cpu_cores, Some(vec![4, 7]));
             assert_eq!(settings.limits.cpu_count, None);
             file.override_cpu_selection(None, None, Some(2)).unwrap();
-            let settings = LauncherSettings::resolve(None, None, None, None, false, &file).unwrap();
+            let settings =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
             assert_eq!(settings.limits.cpu_cores, None);
             assert_eq!(settings.limits.cpu_count, Some(2));
             assert_eq!(file.launcher.profiles["other"], other);
@@ -2182,7 +2817,7 @@ command = "/bin/true"
         )
         .unwrap();
         assert!(matches!(
-            LauncherSettings::resolve(None, None, None, None, false, &file),
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
             Err(SettingsError::InvalidResourceLimits("launcher profile"))
         ));
     }
@@ -2232,30 +2867,772 @@ command = "/bin/true"
         }
     }
 
+    fn mount_file() -> FileConfig {
+        toml::from_str(
+            r#"
+runtime = "bubblewrap"
+socket = "/unused.sock"
+[launcher.profiles.default]
+command = "sh"
+bind_mounts = [{ source = "@workspace", destination = "/workspace", access = "rw" }]
+"#,
+        )
+        .unwrap()
+    }
+
+    fn fingerprint_file() -> FileConfig {
+        toml::from_str(r#"
+runtime = "bubblewrap"
+[launcher.profiles.default]
+command = "omp --model initial"
+herdr_agent = "omp"
+network = "host"
+identity = "herdr"
+environment = ["PATH", "RUNROOM_FINGERPRINT_MIRROR_TEST_8AD790"]
+set_environment = { RUNROOM_LITERAL = "declared" }
+bind_mounts = [
+    { source = "@workspace", destination = "/workspace", access = "rw" },
+    { source = "~/runroom-fingerprint-required-absent-8ad790", destination = "~/state", access = "ro" },
+    { executable = "runroom-fingerprint-absent-8ad790", access = "ro", required = false },
+]
+devices = [{ class = "runroom_fingerprint_absent_8ad790", required = false }]
+memory_max_bytes = 1048576
+tasks_max = 64
+cpu_quota_basis_points = 10000
+"#).unwrap()
+    }
+
+    fn fingerprint_of(file: &FileConfig) -> String {
+        EffectiveLauncherConfig::merge(None, None, None, None, None, false, file)
+            .unwrap()
+            .fingerprint()
+            .unwrap()
+    }
+
+    #[test]
+    fn fingerprint_detects_declared_policy_changes_without_host_resolution() {
+        type PolicyMutation = (&'static str, fn(&mut ProfileFileConfig));
+        let file = fingerprint_file();
+        let original = fingerprint_of(&file);
+        assert_eq!(original.len(), 67);
+        assert!(original.starts_with("v1:"));
+        assert!(
+            original[3..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        let mutations: &[PolicyMutation] = &[
+            ("network", |p| p.network = Some(NetworkFileMode::None)),
+            ("project environment", |p| {
+                p.project_environment = Some(true);
+            }),
+            ("identity", |p| p.identity = None),
+            ("agent label", |p| p.herdr_agent = Some("different".into())),
+            ("mirrored name", |p| {
+                p.environment.push("RUNROOM_ANOTHER_NAME".into());
+            }),
+            ("literal value", |p| {
+                p.set_environment
+                    .insert("RUNROOM_LITERAL".into(), "changed".into());
+            }),
+            ("literal name", |p| {
+                p.set_environment
+                    .insert("RUNROOM_ADDED".into(), "declared".into());
+            }),
+            ("workspace access", |p| {
+                p.bind_mounts[0].access = BindAccessFileMode::Ro;
+            }),
+            ("workspace order", |p| p.bind_mounts.swap(0, 1)),
+            ("bind access", |p| {
+                p.bind_mounts[1].access = BindAccessFileMode::Rw;
+            }),
+            ("bind optionality", |p| p.bind_mounts[1].required = false),
+            ("bind source", |p| {
+                p.bind_mounts[1].source = BindMountFileSource::Path("~/other".into());
+            }),
+            ("bind destination", |p| {
+                p.bind_mounts[1].destination = Some("/other".into());
+            }),
+            ("executable selector", |p| {
+                p.bind_mounts[2].source = BindMountFileSource::Executable("different-tool".into());
+            }),
+            ("executable required", |p| p.bind_mounts[2].required = true),
+            ("device selector", |p| {
+                p.devices[0].selector = DeviceSelector::Path("/dev/null".into());
+            }),
+            ("device required", |p| p.devices[0].required = true),
+            ("memory", |p| p.memory_max_bytes = Some(2_097_152)),
+            ("tasks", |p| p.tasks_max = Some(128)),
+            ("cpu quota", |p| p.cpu_quota_basis_points = Some(20_000)),
+            ("cpu cores", |p| p.cpu_cores = Some(vec![1, 3])),
+            ("cpu count", |p| p.cpu_count = Some(2)),
+        ];
+        for (name, change) in mutations {
+            let mut candidate = file.clone();
+            change(candidate.launcher.profiles.get_mut("default").unwrap());
+            assert_ne!(fingerprint_of(&candidate), original, "{name}");
+        }
+        let mut native = file;
+        native.runtime = Some(RuntimeFileKind::Native);
+        let profile = native.launcher.profiles.get_mut("default").unwrap();
+        profile.identity = None;
+        profile.devices.clear();
+        let mut bubblewrap = native.clone();
+        bubblewrap.runtime = Some(RuntimeFileKind::Bubblewrap);
+        assert_ne!(fingerprint_of(&native), fingerprint_of(&bubblewrap));
+    }
+
+    #[test]
+    fn fingerprint_excludes_command_routing_and_frozen_cli_grants() {
+        let file = fingerprint_file();
+        let original = fingerprint_of(&file);
+        let mut replay = file.clone();
+        replay.socket = Some("~/other-control.sock".into());
+        replay.launcher.name = Some("different-workspace".into());
+        replay.launcher.verbose = Some(true);
+        replay.launcher.profiles.get_mut("default").unwrap().command =
+            Some("omp --resume 'opaque session reference'".into());
+        assert_eq!(fingerprint_of(&replay), original);
+        let declared = replay.launcher.profiles["default"].clone();
+        replay.override_launch_mode(None, true).unwrap();
+        assert_eq!(replay.launcher.profiles["default"], declared);
+        assert_eq!(replay.launcher.name, None);
+        let effective = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            None,
+            Some("omp -r another --resume latest".into()),
+            None,
+            false,
+            &replay,
+        )
+        .unwrap()
+        .with_launch_mounts(
+            vec![PathBuf::from("unresolved-cli-grant")],
+            vec!["unresolved@/frozen:rw".into()],
+        )
+        .unwrap();
+        assert_eq!(effective.fingerprint().unwrap(), original);
+    }
+
+    #[test]
+    fn fingerprint_ignores_formatting_and_unselected_profiles() {
+        let first: FileConfig = toml::from_str(
+            r#"
+[launcher.profiles.default]
+command = "omp"
+set_environment = { B = "two", A = "one" }
+"#,
+        )
+        .unwrap();
+        let formatted: FileConfig = toml::from_str(
+            r#"
+# A reordered, formatted declaration has identical selected intent.
+[launcher.profiles.default]
+set_environment={A="one",B="two"}
+command='omp'
+[launcher.profiles.unselected]
+command = "pi --resume whatever"
+environment = ["AN_UNRELATED_NAME"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(fingerprint_of(&first), fingerprint_of(&formatted));
+    }
+
+    #[test]
+    fn fingerprint_retains_binding_layer_provenance_and_order() {
+        let inherited: FileConfig = toml::from_str(
+            r#"
+[launcher.base]
+command = "omp"
+bind_mounts = [{ source = "~/absent", destination = "~/grant", access = "ro", required = false }]
+[launcher.profiles.default]
+bind_mounts = [{ source = "/absent", destination = "/grant", access = "rw", required = false }]
+"#,
+        )
+        .unwrap();
+        let direct: FileConfig = toml::from_str(
+            r#"
+[launcher.profiles.default]
+command = "omp"
+bind_mounts = [
+    { source = "~/absent", destination = "~/grant", access = "ro", required = false },
+    { source = "/absent", destination = "/grant", access = "rw", required = false },
+]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            inherited.launcher.profiles["default"].bind_mounts,
+            direct.launcher.profiles["default"].bind_mounts
+        );
+        assert_ne!(fingerprint_of(&inherited), fingerprint_of(&direct));
+        let mut reversed = direct.clone();
+        reversed
+            .launcher
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .bind_mounts
+            .reverse();
+        assert_ne!(fingerprint_of(&reversed), fingerprint_of(&direct));
+    }
+
+    #[test]
+    fn fingerprint_does_not_read_home_path_mirrored_values_or_cwd() {
+        const CHILD: &str = "RUNROOM_FINGERPRINT_CHILD_TEST_8AD790";
+        if env::var_os(CHILD).is_some() {
+            println!("FINGERPRINT:{}", fingerprint_of(&fingerprint_file()));
+            return;
+        }
+        let fixture = DeviceFixture::new();
+        let mut fingerprints = Vec::new();
+        for (home, path, value, directory) in [
+            (None, None, "first", fixture.root.clone()),
+            (
+                Some("/missing-home-one"),
+                Some("/missing-path-one"),
+                "second",
+                fixture.dev.clone(),
+            ),
+            (
+                Some("/missing-home-two"),
+                Some("/missing-path-two"),
+                "third",
+                fixture.classes.clone(),
+            ),
+        ] {
+            let mut child = std::process::Command::new(env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::tests::fingerprint_does_not_read_home_path_mirrored_values_or_cwd",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUNROOM_FINGERPRINT_MIRROR_TEST_8AD790", value)
+                .env_remove("HOME")
+                .env_remove("PATH")
+                .current_dir(directory);
+            if let Some(home) = home {
+                child.env("HOME", home);
+            }
+            if let Some(path) = path {
+                child.env("PATH", path);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fingerprints.push(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        line.find("FINGERPRINT:")
+                            .map(|offset| line[offset..].to_owned())
+                    })
+                    .unwrap(),
+            );
+        }
+        assert!(
+            fingerprints
+                .iter()
+                .all(|fingerprint| fingerprint == &fingerprints[0])
+        );
+    }
+
+    #[test]
+    fn no_worktree_supplies_missing_workspace_only_at_resolution() {
+        for mount in [
+            "",
+            "bind_mounts = [{ source = '@workspace', access = 'ro' }]",
+            "bind_mounts = [{ source = '@workspace', destination = '/other', access = 'ro' }]",
+        ] {
+            let mut file: FileConfig = toml::from_str(&format!(
+                r#"
+runtime = "bubblewrap"
+[launcher.profiles.default]
+command = "omp"
+identity = "herdr"
+{mount}
+"#
+            ))
+            .unwrap();
+            file.override_launch_mode(None, true).unwrap();
+            let declared = file.launcher.profiles["default"].clone();
+            let effective =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+            assert_eq!(effective.runtime.bind_mounts, declared.bind_mounts);
+            let mut resolved_profile = declared;
+            rewrite_workspace_binding(&mut resolved_profile);
+            let mounts = resolve_bind_mounts(&resolved_profile, RuntimeKind::Bubblewrap).unwrap();
+            assert_eq!(mounts.len(), 1);
+            assert_eq!(mounts[0].source, BindMountSource::Workspace);
+            assert_eq!(mounts[0].destination, Path::new("/workspace"));
+            assert_eq!(mounts[0].access, BindAccess::ReadWrite);
+        }
+    }
+
+    #[test]
+    fn no_worktree_rewrite_preserves_alias_override_provenance() {
+        const CHILD: &str = "RUNROOM_NO_WORKTREE_ALIAS_CHILD_8AD790";
+        if env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(env::var_os("HOME").unwrap());
+            let root = PathBuf::from(env::var_os(CHILD).unwrap());
+            let existing = root.join("source");
+            fs::write(&existing, "base grant").unwrap();
+            let mut file: FileConfig = toml::from_str(&format!(
+                r#"
+runtime = "bubblewrap"
+[launcher.base]
+command = "omp"
+bind_mounts = [
+    {{ source = "@workspace", destination = "~/workspace", access = "ro" }},
+    {{ source = "{}", destination = "~/grant", access = "ro" }},
+]
+[launcher.profiles.default]
+bind_mounts = [
+    {{ source = "@workspace", destination = "/workspace", access = "rw" }},
+    {{ source = "{}", destination = "{}", access = "rw", required = false }},
+]
+"#,
+                existing.display(),
+                root.join("absent").display(),
+                home.join("grant").display()
+            ))
+            .unwrap();
+            let original = fingerprint_of(&file);
+            file.override_launch_mode(None, true).unwrap();
+            assert_eq!(fingerprint_of(&file), original);
+            let mut profile = file.launcher.profiles["default"].clone();
+            rewrite_workspace_binding(&mut profile);
+            assert_eq!(profile.inherited_bind_mount_count, 2);
+            let mounts = resolve_bind_mounts(&profile, RuntimeKind::Bubblewrap).unwrap();
+            // The absent optional child revokes the inherited host grant, and
+            // both declared workspace mappings collapse to one contextual bind.
+            assert_eq!(mounts.len(), 1);
+            assert_eq!(mounts[0].source, BindMountSource::Workspace);
+            assert_eq!(mounts[0].destination, Path::new("/workspace"));
+            assert_eq!(mounts[0].access, BindAccess::ReadWrite);
+            return;
+        }
+        let fixture = DeviceFixture::new();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::no_worktree_rewrite_preserves_alias_override_provenance",
+            ])
+            .env(CHILD, &fixture.root)
+            .env("HOME", "/home/runroom-no-worktree-test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn selected_config_path_matches_default_lookup_without_hiding_load_errors() {
+        const CHILD: &str = "RUNROOM_CONFIG_PATH_CHILD_8AD790";
+        const EXPECTED: &str = "RUNROOM_CONFIG_PATH_EXPECTED_8AD790";
+        if let Some(expectation) = env::var_os(CHILD) {
+            let expected = env::var_os(EXPECTED).map(PathBuf::from);
+            assert_eq!(selected_config_path(), expected);
+            match expectation.to_str().unwrap() {
+                "loaded" => assert!(
+                    load_default()
+                        .unwrap()
+                        .launcher
+                        .profiles
+                        .contains_key("default")
+                ),
+                "absent" => assert_eq!(load_default().unwrap(), FileConfig::default()),
+                "parse" => assert!(matches!(load_default(), Err(ConfigError::Parse { .. }))),
+                "read" => assert!(matches!(load_default(), Err(ConfigError::Read { .. }))),
+                _ => unreachable!(),
+            }
+            return;
+        }
+        let fixture = DeviceFixture::new();
+        let home = fixture.root.join("home");
+        let default = home.join(".config/runroom/config.toml");
+        let xdg = fixture.root.join("xdg");
+        let override_path = xdg.join("runroom/config.toml");
+        let missing = fixture.root.join("missing");
+        let invalid = fixture.root.join("invalid");
+        let invalid_path = invalid.join("runroom/config.toml");
+        let directory = fixture.root.join("directory");
+        for path in [&default, &override_path, &invalid_path] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "[launcher.profiles.default]\ncommand = 'omp'\n").unwrap();
+        }
+        fs::write(&invalid_path, "not valid toml!").unwrap();
+        fs::create_dir_all(directory.join("runroom/config.toml")).unwrap();
+        let relative = PathBuf::from("relative-invalid-xdg");
+        for (xdg_value, home_value, expected, result) in [
+            (Some(&xdg), Some(&home), Some(&override_path), "loaded"),
+            (None, Some(&home), Some(&default), "loaded"),
+            (Some(&relative), Some(&home), Some(&default), "loaded"),
+            (Some(&missing), Some(&home), None, "absent"),
+            (None, None, None, "absent"),
+            (Some(&invalid), Some(&home), Some(&invalid_path), "parse"),
+            (Some(&directory), Some(&home), None, "read"),
+        ] {
+            let mut child = std::process::Command::new(env::current_exe().unwrap());
+            child.args([
+                "--exact", "config::tests::selected_config_path_matches_default_lookup_without_hiding_load_errors",
+            ]).env(CHILD, result).env_remove(EXPECTED)
+                .env_remove("XDG_CONFIG_HOME").env_remove("HOME");
+            if let Some(xdg) = xdg_value {
+                child.env("XDG_CONFIG_HOME", xdg);
+            }
+            if let Some(home) = home_value {
+                child.env("HOME", home);
+            }
+            if let Some(expected) = expected {
+                child.env(EXPECTED, expected);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn merge_retains_missing_mounts_and_defers_required_host_checks() {
+        let fixture = DeviceFixture::new();
+        let missing = fixture.root.join("missing");
+        for required in [true, false] {
+            let mut file = file_config();
+            file.launcher.profiles.get_mut("pi").unwrap().bind_mounts = vec![BindMountFileConfig {
+                source: BindMountFileSource::Path(missing.to_str().unwrap().to_owned()),
+                destination: Some(PathBuf::from("/missing")),
+                access: BindAccessFileMode::Ro,
+                required,
+            }];
+            let effective =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+            assert_eq!(
+                effective.runtime.bind_mounts,
+                file.launcher.profiles["pi"].bind_mounts
+            );
+            let result = effective.resolve(&fixture.root);
+            if required {
+                assert!(
+                    matches!(result.unwrap_err().downcast_ref::<SettingsError>(),
+                    Some(SettingsError::InvalidBindSource { path, .. }) if path == &missing)
+                );
+            } else {
+                assert_eq!(result.unwrap().runtime.bind_mounts, []);
+            }
+        }
+        let mut file = file_config();
+        file.launcher.profiles.get_mut("pi").unwrap().bind_mounts = vec![BindMountFileConfig {
+            source: BindMountFileSource::Executable(
+                "runroom-guaranteed-missing-executable-8ad790".to_owned(),
+            ),
+            destination: None,
+            access: BindAccessFileMode::Ro,
+            required: true,
+        }];
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        assert!(matches!(
+            effective
+                .resolve(&fixture.root)
+                .unwrap_err()
+                .downcast_ref::<SettingsError>(),
+            Some(SettingsError::ExecutableNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn merge_retains_device_selectors_and_cli_grants_without_discovery() {
+        let mut file = mount_file();
+        file.launcher.profiles.get_mut("default").unwrap().devices = vec![
+            device_class("runroom_missing_class_8ad790", true),
+            device_path("/dev/runroom_missing_device_8ad790", false),
+        ];
+        let effective = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+            .unwrap()
+            .with_launch_mounts(vec![], vec!["missing@/documents:ro".to_owned()])
+            .unwrap();
+        assert_eq!(
+            effective.runtime.devices,
+            file.launcher.profiles["default"].devices
+        );
+        assert_eq!(effective.launch_mounts[0].source, Path::new("missing"));
+        assert_eq!(
+            effective.launch_mounts[0].destination.as_deref(),
+            Some(Path::new("/documents"))
+        );
+        let host_available = validate_bubblewrap_host().is_ok();
+        let error = effective.resolve(Path::new("/")).unwrap_err();
+        if host_available {
+            assert!(matches!(
+                error.downcast_ref::<SettingsError>(),
+                Some(SettingsError::DeviceIo { .. } | SettingsError::MissingDeviceClass(_))
+            ));
+        }
+        let fixture = DeviceFixture::new();
+        file.launcher
+            .profiles
+            .get_mut("default")
+            .unwrap()
+            .devices
+            .clear();
+        let effective = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+            .unwrap()
+            .with_launch_mounts(vec![], vec!["missing@/documents:ro".to_owned()])
+            .unwrap();
+        let error = effective.resolve(&fixture.root).unwrap_err();
+        if host_available {
+            assert!(matches!(error.downcast_ref::<SettingsError>(),
+                Some(SettingsError::InvalidBindSource { path, .. }) if path == &fixture.root.join("missing")));
+        }
+    }
+
+    #[test]
+    fn resolves_cli_mounts_with_canonical_replay_and_declared_basename() {
+        if validate_bubblewrap_host().is_err() {
+            return;
+        }
+        let fixture = DeviceFixture::new();
+        let source = fixture.root.join("documents");
+        fs::create_dir(&source).unwrap();
+        symlink(&source, fixture.root.join("alias")).unwrap();
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &mount_file())
+                .unwrap()
+                .with_launch_mounts(
+                    vec![PathBuf::from("alias")],
+                    vec!["documents@/editable:rw".to_owned()],
+                )
+                .unwrap();
+        let resolved = effective.resolve(&fixture.root).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        assert_eq!(
+            resolved.mount_arguments,
+            [
+                format!("{}@/alias:ro", canonical.display()),
+                format!("{}@/editable:rw", canonical.display()),
+            ]
+        );
+        assert_eq!(
+            resolved.runtime.bind_mounts[1],
+            BindMount {
+                source: BindMountSource::Host(canonical.clone()),
+                destination: PathBuf::from("/alias"),
+                access: BindAccess::ReadOnly,
+            }
+        );
+        assert_eq!(
+            resolved.runtime.bind_mounts[2],
+            BindMount {
+                source: BindMountSource::Host(canonical),
+                destination: PathBuf::from("/editable"),
+                access: BindAccess::ReadWrite,
+            }
+        );
+    }
+
+    #[test]
+    fn mirrored_environment_changes_resolution_not_effective_policy() {
+        const NAME: &str = "RUNROOM_CONFIG_MIRROR_TEST_8AD790";
+        if let Some(value) = env::var_os(NAME) {
+            let file: FileConfig = toml::from_str(
+                r#"
+socket = "relative.sock"
+[launcher.profiles.default]
+command = "sh"
+environment = ["RUNROOM_CONFIG_MIRROR_TEST_8AD790"]
+set_environment = { RUNROOM_CONFIG_LITERAL_TEST = "literal" }
+"#,
+            )
+            .unwrap();
+            let symbolic_file: FileConfig = toml::from_str(
+                r#"
+[launcher.base]
+command = "sh"
+bind_mounts = [{ source = "~/absent", destination = "~/granted", access = "ro", required = false }]
+[launcher.profiles.default]
+"#,
+            )
+            .unwrap();
+            let symbolic =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &symbolic_file)
+                    .unwrap();
+            assert_eq!(symbolic.socket, None);
+            assert_eq!(
+                symbolic.runtime.bind_mounts[0].source,
+                BindMountFileSource::Path("~/absent".to_owned())
+            );
+            let explicit_home = EffectiveLauncherConfig::merge(
+                Some(PathBuf::from("~/control.sock")),
+                None,
+                None,
+                None,
+                None,
+                false,
+                &symbolic_file,
+            )
+            .unwrap();
+            assert!(matches!(
+                explicit_home
+                    .resolve(Path::new("/launch"))
+                    .unwrap_err()
+                    .downcast_ref::<SettingsError>(),
+                Some(SettingsError::MissingHome)
+            ));
+            let effective =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+            assert_eq!(effective.environment_allowlist, [NAME]);
+            assert_eq!(
+                effective.runtime.set_environment["RUNROOM_CONFIG_LITERAL_TEST"],
+                "literal"
+            );
+            println!("POLICY:{}", effective.fingerprint().unwrap());
+            let resolved = effective.resolve(Path::new("/launch")).unwrap();
+            assert_eq!(resolved.socket, Path::new("/launch/relative.sock"));
+            assert_eq!(
+                resolved.runtime.environment,
+                vec![
+                    EnvironmentVariable {
+                        name: NAME.to_owned(),
+                        value
+                    },
+                    EnvironmentVariable {
+                        name: "RUNROOM_CONFIG_LITERAL_TEST".to_owned(),
+                        value: "literal".into()
+                    },
+                ]
+            );
+            return;
+        }
+        // Change environment only in subprocesses, never in the parallel test host.
+        let mut policies = Vec::new();
+        for value in ["first host value", "second host value"] {
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::mirrored_environment_changes_resolution_not_effective_policy",
+                    "--nocapture",
+                ])
+                .env(NAME, value)
+                .env_remove("HOME")
+                .env_remove("PATH")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            policies.push(
+                stdout
+                    .lines()
+                    .find_map(|line| line.find("POLICY:").map(|offset| line[offset..].to_owned()))
+                    .unwrap(),
+            );
+        }
+        assert_eq!(policies[0], policies[1]);
+    }
+
+    #[test]
+    fn host_equivalent_inherited_mounts_override_before_source_resolution() {
+        const CHILD: &str = "RUNROOM_CONFIG_INHERIT_CHILD_8AD790";
+        if env::var_os(CHILD).is_some() {
+            let home = PathBuf::from(env::var_os("HOME").unwrap());
+            let missing = home.join("missing").to_str().unwrap().to_owned();
+            let existing = "/dev/null";
+            for (base_source, base_destination, child_source, child_destination, required) in [
+                ("~/missing", None, existing, Some(missing.as_str()), true),
+                (missing.as_str(), None, existing, Some("~/missing"), true),
+                (existing, Some(missing.as_str()), "~/missing", None, false),
+                (existing, Some("~/missing"), missing.as_str(), None, false),
+            ] {
+                let entry = |source: &str, destination: Option<&str>, required: bool| {
+                    let destination = destination
+                        .map(|path| {
+                            format!(", destination = {}", serde_json::to_string(path).unwrap())
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "{{ source = {}, access = 'ro', required = {required}{destination} }}",
+                        serde_json::to_string(source).unwrap()
+                    )
+                };
+                let text = format!(
+                    "socket = '/unused.sock'\n[launcher.base]\ncommand = 'sh'\nbind_mounts = [{}]\n[launcher.profiles.default]\nbind_mounts = [{}]",
+                    entry(base_source, base_destination, true),
+                    entry(child_source, child_destination, required),
+                );
+                let file: FileConfig = toml::from_str(&text).unwrap();
+                let effective =
+                    EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+                        .unwrap();
+                let resolved = effective.resolve(&home).unwrap();
+                if required {
+                    assert_eq!(resolved.runtime.bind_mounts.len(), 1);
+                    assert_eq!(
+                        resolved.runtime.bind_mounts[0].destination,
+                        Path::new(&missing)
+                    );
+                    assert_eq!(
+                        resolved.runtime.bind_mounts[0].source,
+                        BindMountSource::Host(Path::new(existing).canonicalize().unwrap())
+                    );
+                } else {
+                    assert_eq!(resolved.runtime.bind_mounts, []);
+                }
+            }
+            return;
+        }
+        let fixture = DeviceFixture::new();
+        let home = Path::new("/home").join(fixture.root.file_name().unwrap());
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::host_equivalent_inherited_mounts_override_before_source_resolution",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn launch_mounts_reject_conflicting_and_unsafe_grants() {
-        let fixture = DeviceFixture::new();
-        let runtime = RuntimePolicy {
-            kind: RuntimeKind::Bubblewrap,
-            network: NetworkMode::None,
-            bind_mounts: vec![BindMount {
-                source: BindMountSource::Workspace,
-                destination: PathBuf::from("/workspace"),
-                access: BindAccess::ReadWrite,
-            }],
-            devices: Vec::new(),
-            environment: Vec::new(),
-            home: None,
-        };
-        fs::create_dir(fixture.root.join("docs")).unwrap();
-        fs::create_dir_all(fixture.root.join("other/docs")).unwrap();
-        let error = apply_launch_mounts(
-            &mut runtime.clone(),
-            &[PathBuf::from("docs"), PathBuf::from("other/docs")],
-            &[],
-            &fixture.root,
-        )
-        .unwrap_err();
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &mount_file())
+                .unwrap();
+        let error = effective
+            .clone()
+            .with_launch_mounts(
+                vec![PathBuf::from("docs"), PathBuf::from("other/docs")],
+                vec![],
+            )
+            .unwrap_err();
         assert!(matches!(error.downcast_ref::<SettingsError>(),
             Some(SettingsError::DuplicateBindDestination(path)) if path == Path::new("/docs")));
         for specification in [
@@ -2265,47 +3642,30 @@ command = "/bin/true"
             "dev@/docs/../other:ro",
             "dev@/docs:invalid",
             "@/docs:ro",
-            "missing@/docs:ro",
         ] {
             assert!(
-                apply_launch_mounts(
-                    &mut runtime.clone(),
-                    &[],
-                    &[specification.to_owned()],
-                    &fixture.root,
-                )
-                .is_err(),
+                effective
+                    .clone()
+                    .with_launch_mounts(vec![], vec![specification.to_owned()])
+                    .is_err(),
                 "accepted {specification}"
             );
         }
-        let mut duplicate = runtime.clone();
-        apply_launch_mounts(
-            &mut duplicate,
-            &[],
-            &["dev@/docs:ro".to_owned()],
-            &fixture.root,
-        )
-        .unwrap();
-        let error = apply_launch_mounts(
-            &mut duplicate,
-            &[],
-            &["dev@/docs:rw".to_owned()],
-            &fixture.root,
-        )
-        .unwrap_err();
+        let duplicate = effective
+            .clone()
+            .with_launch_mounts(vec![], vec!["dev@/docs:ro".to_owned()])
+            .unwrap();
+        let error = duplicate
+            .with_launch_mounts(vec![], vec!["dev@/docs:rw".to_owned()])
+            .unwrap_err();
+        assert!(matches!(error.downcast_ref::<SettingsError>(),
+            Some(SettingsError::DuplicateBindDestination(path)) if path == Path::new("/docs")));
+        let mut native = effective;
+        native.runtime.kind = RuntimeKind::Native;
         assert!(
-            matches!(error.downcast_ref::<SettingsError>(), Some(SettingsError::DuplicateBindDestination(path)) if path == Path::new("/docs"))
-        );
-        let mut native = runtime;
-        native.kind = RuntimeKind::Native;
-        assert!(
-            apply_launch_mounts(
-                &mut native,
-                &[],
-                &["dev@/docs:ro".to_owned()],
-                &fixture.root
-            )
-            .is_err()
+            native
+                .with_launch_mounts(vec![], vec!["dev@/docs:ro".to_owned()])
+                .is_err()
         );
     }
 
@@ -2692,7 +4052,7 @@ command = "/bin/true"
             .expect("profile")
             .devices = vec![device_class("nvidia", false)];
         assert!(matches!(
-            LauncherSettings::resolve(None, None, None, None, false, &file),
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
             Err(SettingsError::DevicesRequireBubblewrap)
         ));
     }
@@ -2717,6 +4077,7 @@ command = "/bin/true"
                 resource_ceiling: ResourceCeilingFileConfig::default(),
                 verbose: Some(true),
             },
+            no_worktree: false,
         }
     }
     fn daemon_file_config() -> FileConfig {
@@ -2820,7 +4181,7 @@ verbose = false
         for runtime in [None, Some(RuntimeFileKind::Native)] {
             file.runtime = runtime;
             assert!(matches!(
-                LauncherSettings::resolve(None, None, None, None, false, &file),
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
                 Err(SettingsError::PrivateNetworkRequiresBubblewrap),
             ));
         }
@@ -2829,11 +4190,12 @@ verbose = false
     #[test]
     fn command_line_values_override_selected_profile() {
         let file = file_config();
-        let launcher = LauncherSettings::resolve(
+        let launcher = EffectiveLauncherConfig::merge(
             Some(PathBuf::from("/cli-launcher.sock")),
             Some("cli".to_owned()),
             Some("pi".to_owned()),
             Some("pi --model 'cli model'".to_owned()),
+            None,
             false,
             &file,
         )
@@ -2848,7 +4210,7 @@ verbose = false
         )
         .expect("resolve daemon settings");
 
-        assert_eq!(launcher.socket, PathBuf::from("/cli-launcher.sock"));
+        assert_eq!(launcher.socket, Some(PathBuf::from("/cli-launcher.sock")));
         assert_eq!(launcher.name, Some(WorkspaceName("cli".to_owned())));
         assert_eq!(launcher.profile, "pi");
         assert_eq!(launcher.command.executable, PathBuf::from("pi"));
@@ -2875,6 +4237,7 @@ verbose = false
             environment: Vec::new(),
             set_environment: BTreeMap::new(),
             command: Some("/bin/true".to_owned()),
+            herdr_agent: None,
             project_environment: None,
             network: Some(NetworkFileMode::None),
             bind_mounts: vec![
@@ -2891,6 +4254,7 @@ verbose = false
                     required: true,
                 },
             ],
+            inherited_bind_mount_count: 0,
             devices: Vec::new(),
             memory_max_bytes: None,
             tasks_max: None,
@@ -2909,7 +4273,9 @@ verbose = false
             ..FileConfig::default()
         };
 
-        let settings = LauncherSettings::resolve(None, None, None, None, false, &file)
+        let settings = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+            .expect("merge Bubblewrap profile")
+            .resolve(Path::new("/"))
             .expect("resolve Bubblewrap profile");
 
         assert_eq!(settings.runtime.kind, RuntimeKind::Bubblewrap);
@@ -2955,9 +4321,17 @@ verbose = false
 
             file.override_launch_mode(None, true)
                 .expect("select directory launch");
-            let mounts =
-                resolve_bind_mounts(&file.launcher.profiles["pi"], RuntimeKind::Bubblewrap)
-                    .expect("resolve directory permissions");
+            let effective =
+                EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+                    .expect("merge directory launch before host resolution");
+            assert_eq!(
+                effective.runtime.bind_mounts,
+                file.launcher.profiles["pi"].bind_mounts
+            );
+            let mut resolved_profile = file.launcher.profiles["pi"].clone();
+            rewrite_workspace_binding(&mut resolved_profile);
+            let mounts = resolve_bind_mounts(&resolved_profile, RuntimeKind::Bubblewrap)
+                .expect("resolve directory permissions");
             assert_eq!(
                 mounts,
                 [
@@ -2988,28 +4362,45 @@ verbose = false
             },
             ..FileConfig::default()
         };
-        let missing_profile = LauncherSettings::resolve(None, None, None, None, false, &base)
-            .expect_err("reject missing profile");
-        let unknown =
-            LauncherSettings::resolve(None, None, Some("unknown".to_owned()), None, false, &base)
-                .expect_err("reject unknown profile");
-        let missing_command =
-            LauncherSettings::resolve(None, None, Some("test".to_owned()), None, false, &base)
-                .expect_err("reject missing command");
-        let empty = LauncherSettings::resolve(
+        let missing_profile =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &base)
+                .expect_err("reject missing profile");
+        let unknown = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            Some("unknown".to_owned()),
+            None,
+            None,
+            false,
+            &base,
+        )
+        .expect_err("reject unknown profile");
+        let missing_command = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            Some("test".to_owned()),
+            None,
+            None,
+            false,
+            &base,
+        )
+        .expect_err("reject missing command");
+        let empty = EffectiveLauncherConfig::merge(
             None,
             None,
             Some("test".to_owned()),
             Some("  # no executable".to_owned()),
+            None,
             false,
             &base,
         )
         .expect_err("reject empty command");
-        let malformed = LauncherSettings::resolve(
+        let malformed = EffectiveLauncherConfig::merge(
             None,
             None,
             Some("test".to_owned()),
             Some("pi 'unterminated".to_owned()),
+            None,
             false,
             &base,
         )
@@ -3029,10 +4420,11 @@ verbose = false
 
     #[test]
     fn rejects_invalid_workspace_and_mount_configuration() {
-        let empty_name = LauncherSettings::resolve(
+        let empty_name = EffectiveLauncherConfig::merge(
             Some(PathBuf::from("/unused.sock")),
             Some("  ".to_owned()),
             Some("pi".to_owned()),
+            None,
             None,
             false,
             &file_config(),
@@ -3052,9 +4444,11 @@ verbose = false
                 set_environment: BTreeMap::new(),
                 environment: Vec::new(),
                 command: Some("pi".to_owned()),
+                herdr_agent: None,
                 project_environment: None,
                 network: None,
                 bind_mounts: Vec::new(),
+                inherited_bind_mount_count: 0,
                 devices: Vec::new(),
                 memory_max_bytes: None,
                 tasks_max: None,
@@ -3071,6 +4465,7 @@ verbose = false
                 set_environment: BTreeMap::new(),
                 environment: Vec::new(),
                 command: Some("pi".to_owned()),
+                herdr_agent: None,
                 project_environment: None,
                 network: None,
                 bind_mounts: vec![BindMountFileConfig {
@@ -3079,6 +4474,7 @@ verbose = false
                     access: BindAccessFileMode::Ro,
                     required: true,
                 }],
+                inherited_bind_mount_count: 0,
                 devices: Vec::new(),
                 memory_max_bytes: None,
                 tasks_max: None,
@@ -3126,9 +4522,16 @@ verbose = false
         profile.memory_max_bytes = Some(1 << 30);
         profile.tasks_max = Some(128);
         profile.cpu_quota_basis_points = Some(15_000);
-        let launcher =
-            LauncherSettings::resolve(None, None, Some("pi".to_owned()), None, false, &file)
-                .expect("valid limits");
+        let launcher = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            Some("pi".to_owned()),
+            None,
+            None,
+            false,
+            &file,
+        )
+        .expect("valid limits");
         assert_eq!(launcher.limits.memory_max_bytes, Some(1 << 30));
 
         file.daemon.resource_ceiling.memory_max_bytes = Some(1 << 29);
@@ -3138,7 +4541,15 @@ verbose = false
             .expect("valid daemon ceiling");
         assert_eq!(daemon.resource_ceiling.memory_max_bytes, Some(1 << 29));
         assert!(matches!(
-            LauncherSettings::resolve(None, None, Some("pi".to_owned()), None, false, &file),
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                Some("pi".to_owned()),
+                None,
+                None,
+                false,
+                &file
+            ),
             Err(SettingsError::InvalidResourceLimits("launcher profile"))
         ));
 
@@ -3148,7 +4559,15 @@ verbose = false
             .expect("pi profile")
             .tasks_max = Some(0);
         assert!(matches!(
-            LauncherSettings::resolve(None, None, Some("pi".to_owned()), None, false, &file),
+            EffectiveLauncherConfig::merge(
+                None,
+                None,
+                Some("pi".to_owned()),
+                None,
+                None,
+                false,
+                &file
+            ),
             Err(SettingsError::InvalidResourceLimits("launcher profile"))
         ));
     }
@@ -3171,7 +4590,7 @@ verbose = false
                  [launcher.profiles.pi]\ncommand = '/bin/true'\n{selection}\n"
             ))
             .expect("parse CPU selection");
-            let result = LauncherSettings::resolve(None, None, None, None, false, &file);
+            let result = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file);
             if valid {
                 result.expect("valid CPU selection");
             } else {
@@ -3194,9 +4613,16 @@ verbose = false
 
         file.override_cpu_selection(Some("other"), None, Some(2))
             .expect("apply count override to invalid configured selection");
-        let settings =
-            LauncherSettings::resolve(None, None, Some("other".to_owned()), None, false, &file)
-                .expect("resolve effective count selection");
+        let settings = EffectiveLauncherConfig::merge(
+            None,
+            None,
+            Some("other".to_owned()),
+            None,
+            None,
+            false,
+            &file,
+        )
+        .expect("resolve effective count selection");
         assert_eq!(settings.limits.cpu_count, Some(2));
         assert_eq!(settings.limits.cpu_cores, None);
         assert_eq!(file.launcher.profiles["pi"].cpu_count, Some(8));
@@ -3205,7 +4631,7 @@ verbose = false
             .expect("apply core IDs to the default profile");
         file.override_cpu_selection(None, None, None)
             .expect("absent CLI selection preserves profile values");
-        let settings = LauncherSettings::resolve(None, None, None, None, false, &file)
+        let settings = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
             .expect("resolve effective explicit core selection");
         assert_eq!(settings.limits.cpu_cores, Some(vec![4, 7]));
         assert_eq!(settings.limits.cpu_count, None);
@@ -3213,7 +4639,7 @@ verbose = false
         file.override_cpu_selection(None, None, Some(0))
             .expect("apply invalid CLI selection before validation");
         assert!(matches!(
-            LauncherSettings::resolve(None, None, None, None, false, &file),
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file),
             Err(SettingsError::InvalidResourceLimits("launcher profile"))
         ));
     }

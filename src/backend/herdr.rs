@@ -317,25 +317,39 @@ impl NativeHerdrBackend {
     pub(crate) fn publish_activity(
         &self,
         pane_id: &str,
-        profile: &str,
+        agent_label: &str,
         state: HerdrActivityState,
         message: Option<&str>,
         sequence: u64,
+        resume_argv: Option<&[String]>,
     ) -> Result<(), HerdrError> {
         validate_text(pane_id, MAX_ID_BYTES, "pane ID", false)?;
-        validate_text(profile, MAX_LABEL_BYTES, "runtime profile", false)?;
+        validate_text(agent_label, MAX_LABEL_BYTES, "agent label", false)?;
         if let Some(message) = message {
             validate_text(message, MAX_MESSAGE_BYTES, "activity message", true)?;
+        }
+        if let Some(arguments) = resume_argv
+            && (arguments.is_empty()
+                || arguments.len() > 64
+                || arguments.iter().map(String::len).sum::<usize>() > 8192
+                || arguments
+                    .iter()
+                    .any(|argument| argument.contains(['\0', '\n', '\r', '\''])))
+        {
+            return Err(HerdrError::InvalidInput(
+                "resume argv exceeds Herdr limits or contains forbidden characters",
+            ));
         }
         let result: OkResult = self.request(
             "pane.report_agent",
             &ReportActivityParams {
                 pane_id,
                 source: "runroom",
-                agent: profile,
+                agent: agent_label,
                 state,
                 message,
                 seq: sequence,
+                resume_argv,
             },
             self.timeout,
         )?;
@@ -719,4 +733,6 @@ struct ReportActivityParams<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<&'a str>,
     seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_argv: Option<&'a [String]>,
 }

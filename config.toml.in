@@ -19,6 +19,9 @@
 # launcher.base is abstract and inherited by every runnable profile.
 # Scalars replace; collections merge by key, with profile entries taking precedence.
 # Explicit [] / {} clears an inherited collection. There is no shell interpolation.
+# Herdr reports the foreground command basename, not the profile name.
+# Optional profile/base herdr_agent = "rr:omp" overrides that label. Warning:
+# differing from a detected Pi/OMP label can break resume in unmodified Herdr.
 
 runtime = "bubblewrap"
 socket = "/run/user/@UID@/runroom/control.sock"

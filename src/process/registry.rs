@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{ScopeHandle, ScopeState};
 use crate::model::{
-    ActivityState, ActivityUpdate, HerdrContext, InstanceId, InstanceRecord, InstanceState,
-    ProcessId, ProjectId, ResolvedWorkspace, ResourceLimits, WorkspaceName, WorkspaceOrigin,
-    WorkspaceSelection, WorkspaceSupportMount,
+    ActivityState, ActivityUpdate, AgentSession, HerdrContext, InstanceId, InstanceRecord,
+    InstanceState, ProcessId, ProjectId, ResolvedWorkspace, ResourceLimits, WorkspaceName,
+    WorkspaceOrigin, WorkspaceSelection, WorkspaceSupportMount,
 };
 
 const REGISTRY_VERSION: u32 = 2;
@@ -162,6 +162,12 @@ impl InstanceRegistry {
     }
 
     pub(super) fn insert(&mut self, record: InstanceRecord) -> io::Result<()> {
+        if !crate::model::valid_agent_label(&record.agent_label) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "instance has invalid agent label",
+            ));
+        }
         if !valid_limits(&record.limits) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -387,6 +393,10 @@ struct StoredInstance {
     scope_handle: String,
     workspace: StoredWorkspace,
     profile: String,
+    #[serde(default)]
+    agent_label: Option<String>,
+    #[serde(default)]
+    replay_arguments: Vec<String>,
     limits: StoredLimits,
     leader: u32,
     state: StoredInstanceState,
@@ -467,6 +477,8 @@ struct StoredLimits {
 struct StoredActivity {
     state: StoredActivityState,
     message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<AgentSession>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -484,6 +496,8 @@ impl From<&InstanceRecord> for StoredInstance {
             scope_handle: record.scope_handle.clone(),
             workspace: StoredWorkspace::from(&record.workspace),
             profile: record.profile.clone(),
+            agent_label: Some(record.agent_label.clone()),
+            replay_arguments: record.replay_arguments.clone(),
             limits: StoredLimits {
                 memory_max_bytes: record.limits.memory_max_bytes,
                 tasks_max: record.limits.tasks_max,
@@ -505,6 +519,22 @@ impl From<&InstanceRecord> for StoredInstance {
 impl TryFrom<StoredInstance> for InstanceRecord {
     type Error = io::Error;
     fn try_from(record: StoredInstance) -> io::Result<Self> {
+        let agent_label = record.agent_label.unwrap_or_else(|| {
+            record
+                .replay_arguments
+                .windows(2)
+                .find(|pair| pair[0] == "--command")
+                .and_then(|pair| shell_words::split(&pair[1]).ok())
+                .and_then(|words| words.into_iter().next())
+                .and_then(|executable| {
+                    Path::new(&executable)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .filter(|label| crate::model::valid_agent_label(label))
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "runroom".to_owned())
+        });
         let limits = ResourceLimits {
             memory_max_bytes: record.limits.memory_max_bytes,
             tasks_max: record.limits.tasks_max,
@@ -515,12 +545,17 @@ impl TryFrom<StoredInstance> for InstanceRecord {
         if !valid_name(&record.id)
             || !valid_scope_handle(&record.scope_handle, &record.id)
             || !valid_name(&record.profile)
+            || !crate::model::valid_agent_label(&agent_label)
             || record.created_at_ms > record.updated_at_ms
             || !valid_limits(&limits)
+            || crate::transport::validate_replay_arguments(&record.replay_arguments).is_err()
             || record.activity.as_ref().is_some_and(|activity| {
                 activity.message.as_ref().is_some_and(|value| {
                     value.len() > 4 * 1024 || value.chars().any(char::is_control)
-                })
+                }) || activity
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| crate::transport::validate_session(session).is_err())
             })
             || record.herdr.as_ref().is_some_and(|context| {
                 [
@@ -549,6 +584,8 @@ impl TryFrom<StoredInstance> for InstanceRecord {
             scope_handle: record.scope_handle,
             workspace: record.workspace.try_into()?,
             profile: record.profile,
+            agent_label,
+            replay_arguments: record.replay_arguments,
             limits,
             leader: ProcessId(leader),
             state: record.state.into(),
@@ -701,6 +738,7 @@ impl From<&ActivityUpdate> for StoredActivity {
         Self {
             state: value.state.into(),
             message: value.message.clone(),
+            session: value.session.clone(),
         }
     }
 }
@@ -709,6 +747,7 @@ impl From<StoredActivity> for ActivityUpdate {
         Self {
             state: value.state.into(),
             message: value.message,
+            session: value.session,
         }
     }
 }
@@ -760,6 +799,80 @@ mod tests {
     impl Drop for TestRegistry {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn durable_replay_and_root_session_survive_registry_reload() {
+        let fixture = TestRegistry::new("durable-replay");
+        let mut registry = InstanceRegistry::load(fixture.path()).unwrap();
+        let mut launched = record(1, InstanceState::Running);
+        launched.profile = "coding".to_owned();
+        launched.agent_label = "omp".to_owned();
+        launched.replay_arguments = [
+            "--socket",
+            "/run/runroom.sock",
+            "--profile",
+            "coding",
+            "--herdr-agent",
+            "omp",
+            "--network",
+            "none",
+            "--cpu-cores",
+            "1,3",
+            "--here",
+            "--no-worktree",
+            "--mount",
+            "/source@/target:rw",
+            "--command",
+            "omp --model 'configured model'",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        launched.activity = Some(ActivityUpdate {
+            state: ActivityState::Idle,
+            message: Some("ready".to_owned()),
+            session: Some(AgentSession {
+                agent: crate::model::SessionAgent::Omp,
+                reference: "/absolute/session's file.json".to_owned(),
+            }),
+        });
+        registry.insert(launched.clone()).unwrap();
+        drop(registry);
+        let restored = InstanceRegistry::load(fixture.path()).unwrap();
+        assert_eq!(restored.get(&launched.id), Some(&launched));
+    }
+
+    #[test]
+    fn old_records_without_replay_are_explicitly_non_replayable() {
+        let original = record(1, InstanceState::Running);
+        let mut value = serde_json::to_value(StoredInstance::from(&original)).unwrap();
+        value.as_object_mut().unwrap().remove("replay_arguments");
+        value.as_object_mut().unwrap().remove("agent_label");
+        let stored: StoredInstance = serde_json::from_value(value).unwrap();
+        let restored = InstanceRecord::try_from(stored).unwrap();
+        assert_eq!(restored.replay_arguments, Vec::<String>::new());
+        assert_eq!(restored.agent_label, "runroom");
+    }
+
+    #[test]
+    fn legacy_label_comes_from_foreground_basename_not_profile() {
+        let mut original = record(1, InstanceState::Running);
+        original.profile = "coding".to_owned();
+        for (command, expected) in [
+            ("/opt/bin/omp --model fast", "omp"),
+            ("'/opt/path with spaces/omp' --model fast", "omp"),
+            ("'unterminated", "runroom"),
+        ] {
+            original.replay_arguments = vec!["--command".to_owned(), command.to_owned()];
+            let mut value = serde_json::to_value(StoredInstance::from(&original)).unwrap();
+            value.as_object_mut().unwrap().remove("agent_label");
+            let restored =
+                InstanceRecord::try_from(serde_json::from_value::<StoredInstance>(value).unwrap())
+                    .unwrap();
+            assert_eq!(restored.agent_label, expected);
+            assert_eq!(restored.profile, "coding");
         }
     }
 
@@ -976,6 +1089,8 @@ mod tests {
                 support_mounts: Vec::new(),
             },
             profile: "pi".to_owned(),
+            agent_label: "runroom".to_owned(),
+            replay_arguments: Vec::new(),
             limits: ResourceLimits::default(),
             leader: ProcessId(NonZeroU32::new(1).expect("nonzero")),
             state,
