@@ -24,6 +24,8 @@ pub struct LauncherContinuation {
     pub workspace: super::WorkspaceSelection,
     pub profile: String,
     pub command: String,
+    /// Normalized CLI-added mounts, reapplied by the routed launcher.
+    pub mount_arguments: Vec<String>,
 }
 
 /// Handoff inputs not already supplied by the enclosing launch request.
@@ -31,6 +33,7 @@ pub struct LauncherContinuation {
 pub struct LaunchHandoff {
     pub socket_path: PathBuf,
     pub command: String,
+    pub mount_arguments: Vec<String>,
 }
 
 /// Complete bounded metadata required to prepare and register one launch.
@@ -39,11 +42,12 @@ pub struct PrepareLaunchRequest {
     pub workspace: LaunchRequest,
     pub profile: String,
     pub limits: ResourceLimits,
+    /// Optional host pane identity, validated even when routing is disabled.
     pub herdr: Option<HerdrContext>,
-    /// Execute in the current terminal without Herdr routing or identity.
+    /// Execute in the current terminal without routing; retain optional Herdr identity.
     pub no_multiplex: bool,
     /// Handoff inputs used only when Herdr must continue in another pane.
-    pub continuation: Option<LaunchHandoff>,
+    pub continuation: Option<Box<LaunchHandoff>>,
     /// One-time token binding a resumed launcher to its routed Herdr destination.
     pub continuation_token: Option<String>,
 }
@@ -80,6 +84,8 @@ pub enum NetworkMode {
     None,
     /// Retain the host network namespace.
     Host,
+    /// Isolate host interfaces and forward internet/LAN traffic with slirp4netns.
+    Private,
 }
 
 /// Access granted by one bind mount.
@@ -94,6 +100,8 @@ pub enum BindAccess {
 pub enum BindMountSource {
     /// Canonical host path.
     Host(PathBuf),
+    /// PATH-resolved executable, retaining its canonical location and an alias.
+    Executable(PathBuf),
     /// Worktree selected by the daemon.
     Workspace,
 }
@@ -191,7 +199,7 @@ pub struct PreparedExec {
 
 /// Borrowed descriptor data to inject into a Bubblewrap process image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RuntimeDataFile {
+pub struct RuntimeDataFile<'a> {
     pub descriptor: RawFd,
-    pub destination: &'static str,
+    pub destination: &'a str,
 }

@@ -317,11 +317,13 @@ impl NativeHerdrBackend {
     pub(crate) fn publish_activity(
         &self,
         pane_id: &str,
+        profile: &str,
         state: HerdrActivityState,
         message: Option<&str>,
         sequence: u64,
     ) -> Result<(), HerdrError> {
         validate_text(pane_id, MAX_ID_BYTES, "pane ID", false)?;
+        validate_text(profile, MAX_LABEL_BYTES, "runtime profile", false)?;
         if let Some(message) = message {
             validate_text(message, MAX_MESSAGE_BYTES, "activity message", true)?;
         }
@@ -330,7 +332,7 @@ impl NativeHerdrBackend {
             &ReportActivityParams {
                 pane_id,
                 source: "runroom",
-                agent: "pi",
+                agent: profile,
                 state,
                 message,
                 seq: sequence,
@@ -712,7 +714,7 @@ impl OkResult {
 struct ReportActivityParams<'a> {
     pane_id: &'a str,
     source: &'static str,
-    agent: &'static str,
+    agent: &'a str,
     state: HerdrActivityState,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<&'a str>,

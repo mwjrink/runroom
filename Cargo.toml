@@ -1,6 +1,6 @@
 [package]
 name = "runroom"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 publish = false
 
@@ -19,6 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 shell-words = "1.1"
+signal-hook = "0.3"
+tempfile = "3"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

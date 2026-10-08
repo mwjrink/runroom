@@ -9,6 +9,7 @@ use tracing::debug;
 mod client;
 mod daemon;
 mod launcher;
+mod network;
 mod registry;
 
 pub use client::HostClient;

@@ -26,6 +26,53 @@ fn probe_command(arguments: &[&str]) -> String {
 }
 
 #[test]
+fn daemon_requires_the_exact_application_version_including_patch_and_suffixes() {
+    use std::io::Read;
+
+    let fixture = GitFixture::new();
+    let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, false);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    let application_version = runroom::protocol::APP_VERSION;
+    let other_patch = env!("CARGO_PKG_VERSION_PATCH").parse::<u64>().unwrap() + 1;
+    for version in [
+        format!(
+            "{}.{}.{other_patch}",
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR")
+        ),
+        format!("{application_version}-preview"),
+        format!("{application_version}+different-build"),
+    ] {
+        let mut stream = UnixStream::connect(&fixture.socket).expect("connect mismatch client");
+        stream.set_read_timeout(Some(WAIT_LIMIT)).unwrap();
+        let payload = [b"RRM\0\x01".as_slice(), version.as_bytes()].concat();
+        stream
+            .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+            .unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut length = [0_u8; 4];
+        stream
+            .read_exact(&mut length)
+            .expect("read daemon hello length");
+        let mut hello = vec![0_u8; u32::from_be_bytes(length) as usize];
+        stream
+            .read_exact(&mut hello)
+            .expect("read daemon rejection");
+        assert_eq!(
+            &hello[..6],
+            b"RRM\0\x02\x01",
+            "accepted mismatched version {version}"
+        );
+        assert_eq!(&hello[6..], application_version.as_bytes());
+    }
+    assert_eq!(
+        runroom::HostClient::new(&fixture.socket)
+            .list_instances(None, 100)
+            .expect("matching-version client must remain usable"),
+        Vec::<runroom::model::InstanceRecord>::new()
+    );
+}
+#[test]
 fn native_exec_applies_profile_and_project_values_without_clearing_inheritance() {
     let fixture = GitFixture::new();
     fs::write(
@@ -41,7 +88,7 @@ fn native_exec_applies_profile_and_project_values_without_clearing_inheritance()
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
     wait_for_socket(&mut daemon, &fixture.socket);
     let script = "import json, os; print(json.dumps({'configured': os.getenv('RUNROOM_ENV_PROBE'), 'port': os.getenv('RUNROOM_POSTGRES_PORT'), 'inherited': os.getenv('RUNROOM_UNLISTED')}))";
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["launcher", "--socket"])
         .arg(&fixture.socket)
         .arg("--command")
@@ -95,7 +142,7 @@ fn daemon_can_inspect_and_stop_the_complete_foreground_scope() {
     let fixture = GitFixture::new();
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
     wait_for_socket(&mut daemon, &fixture.socket);
-    let child = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let child = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .arg("launcher")
         .arg("--socket")
         .arg(&fixture.socket)
@@ -386,6 +433,208 @@ fn bubblewrap_exec_uses_sandbox_workspace_and_network_namespace() {
 }
 
 #[test]
+fn default_profile_inherits_base_grants_and_overrides_mounts_and_environment() {
+    let fixture = GitFixture::new();
+    let inherited = fixture.root.join("inherited");
+    let original = fixture.root.join("original");
+    let replacement = fixture.root.join("replacement");
+    let added = fixture.root.join("added");
+    for directory in [&inherited, &original, &replacement, &added] {
+        fs::create_dir(directory).expect("create profile mount source");
+    }
+    fs::write(inherited.join("guide"), "inherited read-only").unwrap();
+    fs::write(original.join("guide"), "base destination").unwrap();
+    fs::write(replacement.join("guide"), "child destination").unwrap();
+    fs::write(added.join("guide"), "child addition").unwrap();
+    let script = r"import errno, json, os, pathlib
+inherited = pathlib.Path('/inherited/guide')
+denied = False
+try:
+    inherited.write_text('forbidden')
+except OSError as error:
+    assert error.errno == errno.EROFS
+    denied = True
+pathlib.Path('/replaced/result').write_text('child write')
+print(json.dumps({
+    'cwd': os.getcwd(),
+    'inherited': inherited.read_text(),
+    'read_only_denied': denied,
+    'replaced': pathlib.Path('/replaced/guide').read_text(),
+    'added': pathlib.Path('/added/guide').read_text(),
+    'base_host': os.getenv('RUNROOM_BASE_HOST'),
+    'child_host': os.getenv('RUNROOM_CHILD_HOST'),
+    'base_literal': os.getenv('RUNROOM_BASE_LITERAL'),
+    'override': os.getenv('RUNROOM_OVERRIDE'),
+    'path': os.getenv('PATH'),
+}))
+";
+    let config = format!(
+        r"runtime = 'bubblewrap'
+[launcher.base]
+command = {}
+network = 'none'
+environment = ['PATH', 'RUNROOM_BASE_HOST']
+set_environment = {{ RUNROOM_BASE_LITERAL = 'base literal', RUNROOM_OVERRIDE = 'base value' }}
+bind_mounts = [
+  {{ source = '@workspace', destination = '/workspace', access = 'rw' }},
+  {{ source = {:?}, destination = '/inherited', access = 'ro' }},
+  {{ source = {:?}, destination = '/replaced', access = 'ro' }},
+]
+[launcher.profiles.default]
+environment = ['RUNROOM_BASE_HOST', 'RUNROOM_CHILD_HOST']
+set_environment = {{ RUNROOM_OVERRIDE = 'child value', PATH = '/profile/path' }}
+bind_mounts = [
+  {{ source = {:?}, destination = '/replaced', access = 'rw' }},
+  {{ source = {:?}, destination = '/added', access = 'ro' }},
+]
+",
+        serde_json::to_string(&shell_words::join([PYTHON, "-c", script])).unwrap(),
+        inherited.to_str().unwrap(),
+        original.to_str().unwrap(),
+        replacement.to_str().unwrap(),
+        added.to_str().unwrap(),
+    );
+    let config_path = fixture.config_home.join("runroom/config.toml");
+    fs::write(&config_path, &config).expect("write inherited default profile");
+    let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
+        .args(["launcher", "--socket"])
+        .arg(&fixture.socket)
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        .env("RUNROOM_BASE_HOST", "inherited host")
+        .env("RUNROOM_CHILD_HOST", "child host")
+        .env("RUNROOM_BASE_LITERAL", "host literal")
+        .env("RUNROOM_OVERRIDE", "host override")
+        .current_dir(&fixture.repository)
+        .output()
+        .expect("launch inherited default profile");
+    assert_output_succeeded("inherited default launcher", &output);
+    assert_eq!(
+        probe_output(&output),
+        serde_json::json!({
+            "cwd": "/workspace",
+            "inherited": "inherited read-only",
+            "read_only_denied": true,
+            "replaced": "child destination",
+            "added": "child addition",
+            "base_host": "inherited host",
+            "child_host": "child host",
+            "base_literal": "base literal",
+            "override": "child value",
+            "path": "/profile/path",
+        })
+    );
+    assert_eq!(
+        fs::read_to_string(replacement.join("result")).unwrap(),
+        "child write"
+    );
+    assert!(!original.join("result").exists());
+    assert_output_succeeded("inherited default daemon", &daemon.wait_for_exit());
+}
+
+#[test]
+fn cli_cpu_override_replaces_the_inherited_default_selection() {
+    let available = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0))
+        .expect("read test CPU affinity");
+    let cpus: Vec<_> = (0..nix::sched::CpuSet::count())
+        .filter(|cpu| available.is_set(*cpu).expect("inspect available CPU"))
+        .take(2)
+        .collect();
+    assert!(!cpus.is_empty(), "test needs an available CPU");
+    let cpu_list = cpus
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = "import json,os; before=sorted(os.sched_getaffinity(0)); os.sched_setaffinity(0,set(range(1024))); print(json.dumps({'before':before,'after':sorted(os.sched_getaffinity(0))}))";
+    for use_count in [true, false] {
+        let fixture = GitFixture::new();
+        let inherited_selection = if use_count {
+            format!("cpu_cores = [{}]", cpus.last().unwrap())
+        } else {
+            "cpu_count = 1".to_owned()
+        };
+        fs::write(
+            fixture.config_home.join("runroom/config.toml"),
+            format!(
+                "runtime = 'bubblewrap'\n[launcher.base]\nnetwork = 'none'\n{inherited_selection}\nbind_mounts = [{{ source = '@workspace', destination = '/workspace', access = 'rw' }}]\n[launcher.profiles.default]\n"
+            ),
+        )
+        .expect("write inherited CPU selection");
+        let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
+        wait_for_socket(&mut daemon, &fixture.socket);
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
+        command
+            .args(["launcher", "--socket"])
+            .arg(&fixture.socket)
+            .arg("--command")
+            .arg(shell_words::join([PYTHON, "-c", script]))
+            .env("XDG_CONFIG_HOME", &fixture.config_home)
+            .current_dir(&fixture.repository);
+        let expected = if use_count {
+            command.args(["--cpu-count", "1"]);
+            serde_json::json!([cpus[0]])
+        } else {
+            command.arg("--cpu-cores").arg(&cpu_list);
+            serde_json::json!(cpus)
+        };
+        let output = command.output().expect("launch inherited CPU override");
+        assert_output_succeeded("inherited CPU override launcher", &output);
+        let observed = probe_output(&output);
+        assert_eq!(observed["before"], expected, "count override={use_count}");
+        assert_eq!(
+            observed["after"], expected,
+            "inherited CPU override allowed widening affinity"
+        );
+        assert_output_succeeded("inherited CPU override daemon", &daemon.wait_for_exit());
+    }
+}
+
+#[test]
+fn launch_mounts_enforce_read_only_and_write_through_explicit_destinations() {
+    let fixture = GitFixture::new();
+    let config_path = fixture.config_home.join("runroom/config.toml");
+    let config = "runtime = 'bubblewrap'\n[launcher]\nprofile = 'sandbox'\n[launcher.profiles.sandbox]\nbind_mounts = [{ source = '@workspace', destination = '/workspace', access = 'rw' }]\n";
+    fs::write(&config_path, config).unwrap();
+    let docs = fixture.root.join("docs with spaces");
+    let assets = fixture.root.join("assets");
+    fs::create_dir(&docs).unwrap();
+    fs::create_dir(&assets).unwrap();
+    fs::write(docs.join("guide"), "host documentation").unwrap();
+    let script = "import errno,pathlib\nfor path in ['/docs/guide', '/docs with spaces/guide']:\n assert pathlib.Path(path).read_text() == 'host documentation'\n try: pathlib.Path(path).write_text('changed')\n except OSError as e: assert e.errno == errno.EROFS\n else: raise AssertionError('read-only mount allowed writing')\npathlib.Path('/assets/result').write_text('sandbox write'); print('mount access verified')";
+    let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
+        .args(["--no-worktree", "--here", "--socket"])
+        .arg(&fixture.socket)
+        .args(["--ro", "../docs with spaces"])
+        .args([
+            "-m",
+            "../docs with spaces@/docs:ro",
+            "--mount",
+            "../assets@/assets:rw",
+        ])
+        .arg("--command")
+        .arg(shell_words::join([PYTHON, "-c", script]))
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        .current_dir(&fixture.repository)
+        .output()
+        .unwrap();
+    assert_output_succeeded("launch mounts", &output);
+    assert_eq!(
+        fs::read_to_string(docs.join("guide")).unwrap(),
+        "host documentation"
+    );
+    assert_eq!(
+        fs::read_to_string(assets.join("result")).unwrap(),
+        "sandbox write"
+    );
+    assert_eq!(fs::read_to_string(config_path).unwrap(), config);
+    assert_output_succeeded("mount daemon", &daemon.wait_for_exit());
+}
+
+#[test]
 fn cpu_restrictions_confine_foreground_and_descendants_even_after_affinity_reset() {
     let available = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0))
         .expect("read test CPU affinity");
@@ -421,7 +670,7 @@ fn cpu_restrictions_confine_foreground_and_descendants_even_after_affinity_reset
             ).expect("write affinity probe profile");
             let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
             wait_for_socket(&mut daemon, &fixture.socket);
-            let mut command = Command::new(env!("CARGO_BIN_EXE_runroom"));
+            let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
             command
                 .args(["launcher", "--socket"])
                 .arg(&fixture.socket)
@@ -446,7 +695,7 @@ fn cpu_restrictions_confine_foreground_and_descendants_even_after_affinity_reset
 }
 
 #[test]
-fn here_foreground_uses_exact_directory_without_git_or_herdr_and_confines_files() {
+fn no_worktree_foreground_uses_exact_directory_without_git_or_herdr_and_confines_files() {
     let fixture = GitFixture::new();
     let plain = fixture.root.join("plain");
     let nested = fixture.repository.join("nested");
@@ -473,14 +722,13 @@ fn here_foreground_uses_exact_directory_without_git_or_herdr_and_confines_files(
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, false);
     wait_for_socket(&mut daemon, &fixture.socket);
     for directory in [&plain, &nested] {
-        let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
-            .args(["--here", "--no-multiplex", "--socket"])
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
+        let output = command
+            .args(["--no-worktree", "--here", "--socket"])
             .arg(&fixture.socket)
             .arg("--command")
             .arg(shell_words::join([PYTHON, "-c", &probe]))
             .env("XDG_CONFIG_HOME", &fixture.config_home)
-            .env("HERDR_SESSION", "unrelated-named-session")
-            .env("HERDR_PANE_ID", "unrelated-pane")
             .current_dir(directory)
             .output()
             .expect("launch exact directory");
@@ -499,12 +747,12 @@ fn here_foreground_uses_exact_directory_without_git_or_herdr_and_confines_files(
     assert!(!fixture.repository.join("inside.txt").exists());
     assert!(
         !fixture.workspaces.exists(),
-        "Here created managed Git worktrees"
+        "No-worktree launch created managed Git worktrees"
     );
 }
 
 #[test]
-fn here_creates_a_default_session_tab_and_preserves_directory_and_cpu_override() {
+fn no_worktree_creates_a_default_session_tab_and_preserves_directory_cpu_and_mount_overrides() {
     let fixture = GitFixture::new();
     let home = fixture.root.join("isolated-home");
     let config_home = home.join(".config");
@@ -519,6 +767,8 @@ fn here_creates_a_default_session_tab_and_preserves_directory_and_cpu_override()
     ).unwrap();
     let directory = fixture.root.join("non Git directory");
     fs::create_dir(&directory).unwrap();
+    fs::write(directory.join("read-only grant"), "readable").unwrap();
+    fs::create_dir(directory.join("writable grant")).unwrap();
     let herdr_socket = config_home.join("herdr/herdr.sock");
     let mut server = spawn_directory_herdr(&home, &config_home, &herdr_config, &directory);
     wait_for_socket(&mut server, &herdr_socket);
@@ -530,10 +780,12 @@ fn here_creates_a_default_session_tab_and_preserves_directory_and_cpu_override()
     let bootstrap_tab = bootstrap["tab"]["tab_id"].as_str().unwrap();
     let mut daemon = spawn_directory_daemon(&fixture, &home, &config_home, &herdr_socket);
     wait_for_socket(&mut daemon, &fixture.socket);
-    let probe = "import os,json,pathlib; descriptor=json.loads(pathlib.Path('/runtime/launch.json').read_text()); p=pathlib.Path('result.tmp'); p.write_text(json.dumps({'cwd':os.getcwd(),'cpus':sorted(os.sched_getaffinity(0)),'workspace':descriptor['workspace']})); p.replace('result.json')";
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
-        .args(["--here", "--socket"])
+    let probe = "import os,json,pathlib; descriptor=json.loads(pathlib.Path('/runtime/launch.json').read_text()); readonly=pathlib.Path('/granted/read-only'); writable=pathlib.Path('/granted/writable/created'); writable.write_text('routed write'); denied=False\ntry:\n readonly.write_text('forbidden')\nexcept OSError:\n denied=True\np=pathlib.Path('result.tmp'); p.write_text(json.dumps({'cwd':os.getcwd(),'cpus':sorted(os.sched_getaffinity(0)),'workspace':descriptor['workspace'],'grant':readonly.read_text(),'read_only_denied':denied,'written':writable.read_text()})); p.replace('result.json')";
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
+        .args(["--no-worktree", "--socket"])
         .arg(&fixture.socket)
+        .args(["--mount", "read-only grant@/granted/read-only:ro"])
+        .args(["-m", "writable grant@/granted/writable:rw"])
         .args(["--cpu-count", "1", "-c"])
         .arg(shell_words::join([PYTHON, "-c", probe]))
         .env("HOME", &home)
@@ -561,6 +813,13 @@ fn here_creates_a_default_session_tab_and_preserves_directory_and_cpu_override()
     assert_eq!(observed["cwd"], "/workspace");
     assert_eq!(observed["cpus"], serde_json::json!([first_cpu]));
     assert_eq!(observed["workspace"]["kind"], "directory");
+    assert_eq!(observed["grant"], "readable");
+    assert_eq!(observed["read_only_denied"], true);
+    assert_eq!(observed["written"], "routed write");
+    assert_eq!(
+        fs::read_to_string(directory.join("writable grant/created")).unwrap(),
+        "routed write"
+    );
     assert_eq!(
         observed["workspace"]["host_path"],
         directory.to_str().unwrap()
@@ -591,11 +850,345 @@ fn here_creates_a_default_session_tab_and_preserves_directory_and_cpu_override()
         !fixture.workspaces.exists(),
         "directory launch created Git worktrees"
     );
-    let stopped = Command::new("herdr")
+    stop_directory_herdr(&home, &config_home, &herdr_config, &mut server);
+}
+
+#[test]
+fn here_no_worktree_preserves_existing_herdr_pane_and_reports_scoped_child_activity() {
+    let fixture = GitFixture::new();
+    let home = fixture.root.join("isolated-home");
+    let config_home = home.join(".config");
+    let herdr_config = config_home.join("herdr/config.toml");
+    let runroom_config = config_home.join("runroom/config.toml");
+    let directory = fixture.root.join("existing pane directory");
+    fs::create_dir_all(&directory).unwrap();
+    fs::create_dir_all(herdr_config.parent().unwrap()).unwrap();
+    fs::create_dir_all(runroom_config.parent().unwrap()).unwrap();
+    fs::write(&herdr_config, "").unwrap();
+    fs::write(
+        &runroom_config,
+        format!(
+            "runtime = 'bubblewrap'\n[launcher]\nprofile = 'reporter'\n[launcher.profiles.reporter]\nidentity = 'herdr'\nnetwork = 'none'\nbind_mounts = [{{ source = '@workspace', destination = '/workspace', access = 'rw' }}, {{ source = '{}', destination = '/runtime/runroom', access = 'rw' }}]\n",
+            fixture.socket.parent().unwrap().display()
+        ),
+    ).unwrap();
+    let herdr_socket = config_home.join("herdr/herdr.sock");
+    let mut server = spawn_directory_herdr(&home, &config_home, &herdr_config, &directory);
+    wait_for_socket(&mut server, &herdr_socket);
+    let bootstrap = herdr_request(
+        &herdr_socket,
+        "workspace.create",
+        &serde_json::json!({"cwd": directory, "label": "Same-pane reporting", "focus": true}),
+    );
+    let pane_id = bootstrap["root_pane"]["pane_id"]
+        .as_str()
+        .expect("bootstrap pane");
+    let before = herdr_request(&herdr_socket, "session.snapshot", &serde_json::json!({}));
+    let mut daemon = spawn_directory_daemon(&fixture, &home, &config_home, &herdr_socket);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    wait_for_socket(
+        &mut daemon,
+        &fixture
+            .socket
+            .parent()
+            .unwrap()
+            .join("activity/status.sock"),
+    );
+
+    let probe = same_pane_activity_probe();
+    let foreground_command = shell_words::join([PYTHON, "-c", &probe]);
+    let launch_command = shell_words::join([
+        env!("CARGO_BIN_EXE_runroom"),
+        "--here",
+        "--no-worktree",
+        "--socket",
+        fixture.socket.to_str().unwrap(),
+        "--command",
+        &foreground_command,
+    ]);
+    let command = format!(
+        "{launch_command} >{} 2>&1",
+        shell_words::quote(directory.join("launcher.log").to_str().unwrap())
+    );
+    herdr_request(
+        &herdr_socket,
+        "pane.send_input",
+        &serde_json::json!({"pane_id": pane_id, "text": command, "keys": ["enter"]}),
+    );
+    let observed = await_pane_probe(&directory, "ready.json", &herdr_socket);
+
+    let client = runroom::HostClient::new(&fixture.socket);
+    let records = client.list_instances(None, 100).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "same-pane launch registered extra instances"
+    );
+    let record = &records[0];
+    let _scope_cleanup = PaneScopeCleanup {
+        socket: fixture.socket.clone(),
+        instance: record.id.clone(),
+    };
+    assert_same_pane_attribution(&directory, &bootstrap, &observed, record);
+
+    assert_scoped_pane_reports(
+        &directory,
+        &herdr_socket,
+        &client,
+        record,
+        &observed,
+        &before,
+        &bootstrap,
+    );
+    fs::write(directory.join("finish"), "").unwrap();
+    assert_eq!(
+        await_pane_probe(&directory, "finished.json", &herdr_socket),
+        true
+    );
+    assert!(
+        !fixture.workspaces.exists(),
+        "same-pane launch created Git worktrees"
+    );
+    stop_directory_herdr(&home, &config_home, &herdr_config, &mut server);
+}
+
+fn assert_same_pane_attribution(
+    directory: &Path,
+    bootstrap: &Value,
+    observed: &Value,
+    record: &runroom::model::InstanceRecord,
+) {
+    let pane_id = bootstrap["root_pane"]["pane_id"].as_str().unwrap();
+    let workspace_id = bootstrap["workspace"]["workspace_id"].as_str().unwrap();
+    assert_eq!(observed["cwd"], "/workspace");
+    let descriptor = &observed["descriptor"];
+    assert_eq!(descriptor["version"], 1);
+    assert_eq!(descriptor["workspace"]["kind"], "directory");
+    assert_eq!(
+        descriptor["workspace"]["host_path"],
+        directory.to_str().unwrap()
+    );
+    assert_eq!(descriptor["herdr"]["workspace_id"], workspace_id);
+    assert_eq!(descriptor["herdr"]["pane_id"], pane_id);
+    assert_eq!(descriptor["agent"]["id"], pane_id);
+    assert_eq!(descriptor["instance_id"], record.id.0);
+    assert_eq!(
+        record.workspace.selection,
+        runroom::model::WorkspaceSelection::Here
+    );
+    assert_eq!(record.workspace.path.as_path(), directory);
+    assert_eq!(record.state, runroom::model::InstanceState::Running);
+    let context = record
+        .herdr
+        .as_ref()
+        .expect("same-pane registry attribution");
+    assert_eq!(context.workspace_id.as_deref(), Some(workspace_id));
+    assert_eq!(context.pane_id.as_deref(), Some(pane_id));
+    assert!(context.session_name.is_none());
+    let scope = observed["cgroup"].as_str().unwrap();
+    assert!(
+        scope.contains(&record.scope_handle),
+        "scope attribution: {scope}"
+    );
+}
+
+fn same_pane_activity_probe() -> String {
+    // This subprocess, not the test process or foreground leader, opens the
+    // daemon's real activity socket. Frames match src/process/daemon.rs.
+    let reporter = r"import json,os,pathlib,socket,struct,sys
+state = int(sys.argv[1])
+message = sys.argv[2].encode('utf-8')
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+    stream.settimeout(5)
+    stream.connect('/runtime/runroom/activity/status.sock')
+    stream.sendall(b'RRA\0' + bytes([1, state]) + struct.pack('>H', len(message)) + message)
+    ack = stream.recv(1)
+    assert ack == b'\0', repr(ack)
+print(json.dumps(dict(pid=os.getpid(), cgroup=pathlib.Path('/proc/self/cgroup').read_text(), ack=list(ack))))
+";
+    format!(
+        r"import json,os,pathlib,subprocess,time
+def publish(name, value):
+    temporary = pathlib.Path(name + '.tmp')
+    temporary.write_text(json.dumps(value))
+    temporary.replace(name)
+def await_file(name):
+    deadline = time.monotonic() + 30
+    while not pathlib.Path(name).exists():
+        assert time.monotonic() < deadline, name
+        time.sleep(0.01)
+descriptor = json.loads(pathlib.Path('/runtime/launch.json').read_text())
+publish('ready.json', dict(pid=os.getpid(), cwd=os.getcwd(), cgroup=pathlib.Path('/proc/self/cgroup').read_text(), descriptor=descriptor))
+for index in range(3):
+    request = 'request-' + str(index) + '.json'
+    await_file(request)
+    state, message = json.loads(pathlib.Path(request).read_text())
+    result = json.loads(subprocess.check_output(['/usr/bin/python3', '-c', {}, str(state), message], timeout=10))
+    publish('reported-' + str(index) + '.json', result)
+await_file('finish')
+publish('finished.json', True)
+",
+        serde_json::to_string(reporter).unwrap()
+    )
+}
+
+fn assert_scoped_pane_reports(
+    directory: &Path,
+    herdr_socket: &Path,
+    client: &runroom::HostClient,
+    record: &runroom::model::InstanceRecord,
+    observed: &Value,
+    before: &Value,
+    bootstrap: &Value,
+) {
+    let pane_id = bootstrap["root_pane"]["pane_id"].as_str().unwrap();
+    let workspace_id = bootstrap["workspace"]["workspace_id"].as_str().unwrap();
+    let tab_id = bootstrap["tab"]["tab_id"].as_str().unwrap();
+    for (index, (wire_state, activity_state, state_name, message)) in [
+        (
+            0,
+            runroom::model::ActivityState::Working,
+            "working",
+            "Working — scoped child",
+        ),
+        (
+            1,
+            runroom::model::ActivityState::Blocked,
+            "blocked",
+            "Waiting — scoped child",
+        ),
+        (
+            2,
+            runroom::model::ActivityState::Idle,
+            "idle",
+            "Ready — scoped child",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request = directory.join(format!("request-{index}.json"));
+        let temporary = directory.join(format!("request-{index}.tmp"));
+        fs::write(
+            &temporary,
+            serde_json::to_vec(&serde_json::json!([wire_state, message])).unwrap(),
+        )
+        .unwrap();
+        fs::rename(&temporary, &request).unwrap();
+        let report = await_pane_probe(directory, &format!("reported-{index}.json"), herdr_socket);
+        assert_eq!(report["ack"], serde_json::json!([0]));
+        assert_ne!(
+            report["pid"], observed["pid"],
+            "leader sent the child report"
+        );
+        assert_eq!(
+            report["cgroup"], observed["cgroup"],
+            "reporter escaped its managed scope"
+        );
+        let current = client.list_instances(None, 100).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, record.id);
+        let activity = current[0]
+            .activity
+            .as_ref()
+            .expect("registered binary activity");
+        assert_eq!(activity.state, activity_state);
+        assert_eq!(activity.message.as_deref(), Some(message));
+        let pane = herdr_request(
+            herdr_socket,
+            "pane.current",
+            &serde_json::json!({"caller_pane_id": pane_id}),
+        );
+        assert_eq!(pane["pane"]["tab_id"], tab_id);
+        assert_eq!(pane["pane"]["workspace_id"], workspace_id);
+        assert_eq!(
+            pane["pane"]["agent"], record.profile,
+            "Herdr must attribute activity to the selected runtime profile"
+        );
+        assert_pane_activity(herdr_socket, pane_id, state_name);
+        let after = herdr_request(herdr_socket, "session.snapshot", &serde_json::json!({}));
+        assert_same_tabs(before, &after);
+    }
+}
+
+fn assert_same_tabs(before: &Value, after: &Value) {
+    for (collection, id) in [
+        ("workspaces", "workspace_id"),
+        ("tabs", "tab_id"),
+        ("panes", "pane_id"),
+    ] {
+        let identities = |snapshot: &Value| {
+            let mut identities = snapshot["snapshot"][collection]
+                .as_array()
+                .expect("Herdr snapshot collection")
+                .iter()
+                .map(|item| item[id].as_str().expect("snapshot identity").to_owned())
+                .collect::<Vec<_>>();
+            identities.sort_unstable();
+            identities
+        };
+        let expected = identities(before);
+        assert!(!expected.is_empty(), "empty baseline {collection}");
+        assert_eq!(
+            identities(after),
+            expected,
+            "same-pane launch changed {collection}"
+        );
+    }
+}
+
+fn assert_pane_activity(socket: &Path, pane_id: &str, state: &str) {
+    let pane = herdr_request(
+        socket,
+        "pane.current",
+        &serde_json::json!({"caller_pane_id": pane_id}),
+    );
+    assert_eq!(
+        pane["pane"]["agent_status"], state,
+        "Herdr activity: {pane}"
+    );
+}
+
+fn await_pane_probe(directory: &Path, filename: &str, socket: &Path) -> Value {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    let path = directory.join(filename);
+    loop {
+        if let Ok(bytes) = fs::read(&path) {
+            return serde_json::from_slice(&bytes).expect("atomic pane probe JSON");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane probe {filename} did not complete; log: {}; snapshot: {}",
+            fs::read_to_string(directory.join("launcher.log")).unwrap_or_default(),
+            herdr_request(socket, "session.snapshot", &serde_json::json!({}))
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct PaneScopeCleanup {
+    socket: PathBuf,
+    instance: runroom::model::InstanceId,
+}
+
+impl Drop for PaneScopeCleanup {
+    fn drop(&mut self) {
+        let _ = runroom::HostClient::new(&self.socket)
+            .stop_instance(self.instance.clone(), StopMode::Force);
+    }
+}
+
+fn stop_directory_herdr(
+    home: &Path,
+    config_home: &Path,
+    herdr_config: &Path,
+    server: &mut ChildGuard,
+) {
+    let stopped = isolated_command("herdr")
         .args(["server", "stop"])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &config_home)
-        .env("HERDR_CONFIG_PATH", &herdr_config)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HERDR_CONFIG_PATH", herdr_config)
         .env_remove("HERDR_SESSION")
         .env_remove("HERDR_SOCKET_PATH")
         .output()
@@ -611,7 +1204,7 @@ fn spawn_directory_herdr(
     directory: &Path,
 ) -> ChildGuard {
     ChildGuard(Some(
-        Command::new("herdr")
+        isolated_command("herdr")
             .arg("server")
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", config_home)
@@ -635,7 +1228,7 @@ fn spawn_directory_daemon(
     herdr_socket: &Path,
 ) -> ChildGuard {
     ChildGuard(Some(
-        Command::new(env!("CARGO_BIN_EXE_runroom"))
+        isolated_command(env!("CARGO_BIN_EXE_runroom"))
             .args(["daemon", "--socket"])
             .arg(&fixture.socket)
             .arg("--workspace-root")
@@ -669,6 +1262,37 @@ fn herdr_request(socket: &Path, method: &str, params: &Value) -> Value {
         "Herdr request failed: {response}"
     );
     response["result"].clone()
+}
+
+#[test]
+fn named_worktree_conflicts_with_no_worktree_but_allows_here() {
+    let fixture = GitFixture::new();
+    let rejected = isolated_command(env!("CARGO_BIN_EXE_runroom"))
+        .args([
+            "--name",
+            "docs",
+            "--no-worktree",
+            "--here",
+            "--command",
+            "/bin/true",
+        ])
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        .current_dir(&fixture.repository)
+        .output()
+        .expect("reject named exact-directory launch");
+    assert_eq!(rejected.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("--name"), "{stderr}");
+    assert!(stderr.contains("--no-worktree"), "{stderr}");
+
+    let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    let (_, allowed) = run_probe(&fixture, &fixture.repository, Some("docs"), false, &[]);
+    assert_output_succeeded("named current-terminal launch", &allowed);
+    assert!(
+        Path::new(probe_output(&allowed)["cwd"].as_str().unwrap()).starts_with(&fixture.workspaces)
+    );
+    assert_output_succeeded("named current-terminal daemon", &daemon.wait_for_exit());
 }
 
 #[test]
@@ -712,7 +1336,7 @@ fn workspace_commands_reject_active_retirement_then_retire_and_repair() {
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, false);
     wait_for_socket(&mut daemon, &fixture.socket);
 
-    let launcher = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let launcher = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["launcher", "--socket"])
         .arg(&fixture.socket)
         .args(["--name", "docs", "--command", "/usr/bin/sleep 30"])
@@ -793,7 +1417,7 @@ fn workspace_commands_reject_active_retirement_then_retire_and_repair() {
 }
 
 #[test]
-fn here_instances_at_worktree_root_and_below_block_retirement() {
+fn no_worktree_instances_at_worktree_root_and_below_block_retirement() {
     let fixture = GitFixture::new();
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, false);
     wait_for_socket(&mut daemon, &fixture.socket);
@@ -870,7 +1494,7 @@ fn daemon_and_launcher_share_mode_specific_toml() {
 
     let mut daemon = ChildGuard::spawn_with_config(&config_home);
     wait_for_socket(&mut daemon, &fixture.socket);
-    let launcher = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let launcher = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .arg("launcher")
         .current_dir(&fixture.repository)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -902,7 +1526,7 @@ fn launcher_requires_a_configured_or_overridden_command() {
         "[launcher]\nprofile = 'test'\n\n[launcher.profiles.test]\nnetwork = 'host'\n",
     )
     .expect("write config");
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["launcher", "--socket", "/unused/runroom.sock"])
         .env("XDG_CONFIG_HOME", &config_home)
         .output()
@@ -932,7 +1556,7 @@ fn command_override_wins_over_configured_default() {
     let mut daemon = ChildGuard::spawn_with_config(&config_home);
     wait_for_socket(&mut daemon, &fixture.socket);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["launcher", "--command", "/bin/true"])
         .current_dir(&fixture.repository)
         .env("XDG_CONFIG_HOME", &config_home)
@@ -944,11 +1568,66 @@ fn command_override_wins_over_configured_default() {
 }
 
 #[test]
+fn private_network_setup_failure_never_executes_the_harness() {
+    let fixture = GitFixture::new();
+    fs::write(
+        fixture.config_home.join("runroom/config.toml"),
+        "runtime = 'bubblewrap'\n[launcher]\nprofile = 'private'\n[launcher.profiles.private]\nnetwork = 'private'\nbind_mounts = [{ source = '@workspace', destination = '/workspace', access = 'rw' }]\n",
+    ).unwrap();
+    let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
+    wait_for_socket(&mut daemon, &fixture.socket);
+    let command = shell_words::join([
+        PYTHON,
+        "-c",
+        "from pathlib import Path; Path('/workspace/unexpected-start').write_text('started')",
+    ]);
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
+        .args(["--here", "--no-worktree", "--socket"])
+        .arg(&fixture.socket)
+        .args(["-c", &command])
+        .env("XDG_CONFIG_HOME", &fixture.config_home)
+        // Bubblewrap and the harness are absolute paths. Only helper lookup fails.
+        .env("PATH", fixture.root.join("missing-helper"))
+        .current_dir(&fixture.repository)
+        .output()
+        .expect("launch without network helper");
+    assert!(
+        !output.status.success(),
+        "network setup unexpectedly succeeded"
+    );
+    assert_output_succeeded("private setup daemon", &daemon.wait_for_exit());
+    let state_file = fixture.root.join("state/instances.json");
+    let registry: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    let handle = runroom::backend::ScopeHandle(
+        registry["instances"][0]["scope_handle"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    let backend = SystemdScopeBackend::connect(&state_file, &[]).unwrap();
+    let deadline = Instant::now() + WAIT_LIMIT;
+    while matches!(
+        backend.inspect(&handle).unwrap(),
+        ScopeState::Active | ScopeState::Starting | ScopeState::Stopping
+    ) {
+        assert!(
+            Instant::now() < deadline,
+            "failed startup left a live sandbox"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !fixture.repository.join("unexpected-start").exists(),
+        "closing a failed startup gate executed the harness"
+    );
+}
+
+#[test]
 fn missing_foreground_executable_reports_exec_failure() {
     let fixture = GitFixture::new();
     let mut daemon = ChildGuard::spawn(&fixture.socket, &fixture.workspaces, true);
     wait_for_socket(&mut daemon, &fixture.socket);
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .arg("launcher")
         .arg("--socket")
         .arg(&fixture.socket)
@@ -977,7 +1656,7 @@ fn invalid_toml_configuration_stops_before_role_startup() {
         .expect("create config directory");
     fs::write(&config_path, "[daemon]\nname = 'docs'\n").expect("write invalid config");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_runroom"))
+    let output = isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["daemon", "--socket", "/unused/runroom.sock"])
         .env("XDG_CONFIG_HOME", &config_home)
         .output()
@@ -997,9 +1676,9 @@ fn run_probe(
     verbose: bool,
     arguments: &[&str],
 ) -> (u32, Output) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_runroom"));
+    let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
     command
-        .arg("launcher")
+        .args(["launcher", "--here"])
         .arg("--socket")
         .arg(&fixture.socket)
         .current_dir(current_directory)
@@ -1048,7 +1727,7 @@ fn git(directory: &Path, arguments: &[&str]) -> Output {
 }
 
 fn workspace_command(fixture: &GitFixture, arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_runroom"))
+    isolated_command(env!("CARGO_BIN_EXE_runroom"))
         .args(["workspace", "--socket"])
         .arg(&fixture.socket)
         .arg("--current-directory")
@@ -1059,20 +1738,24 @@ fn workspace_command(fixture: &GitFixture, arguments: &[&str]) -> Output {
         .expect("run workspace command")
 }
 
-fn start_foreground(fixture: &GitFixture, directory: &Path, here: bool) -> (ChildGuard, Value) {
+fn start_foreground(
+    fixture: &GitFixture,
+    directory: &Path,
+    no_worktree: bool,
+) -> (ChildGuard, Value) {
     let script = format!("{PROBE}; sys.stdout.flush(); import time; time.sleep(30)");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_runroom"));
+    let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
     command
         .args(["launcher", "--socket"])
         .arg(&fixture.socket)
-        .args(["--no-multiplex", "--command"])
+        .args(["--here", "--command"])
         .arg(shell_words::join([PYTHON, "-c", &script]))
         .env("XDG_CONFIG_HOME", &fixture.config_home)
         .current_dir(directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if here {
-        command.arg("--here");
+    if no_worktree {
+        command.arg("--no-worktree");
     }
     let mut foreground = ChildGuard(Some(command.spawn().unwrap()));
     let stdout = foreground.0.as_mut().unwrap().stdout.take().unwrap();
@@ -1086,6 +1769,17 @@ fn start_foreground(fixture: &GitFixture, directory: &Path, here: bool) -> (Chil
         )
     });
     (foreground, probe)
+}
+
+fn isolated_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    // Tests must not inherit attribution or routing from their host Herdr pane.
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"HERDR_") {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 fn unique_temporary_directory() -> PathBuf {
@@ -1197,7 +1891,7 @@ struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
     fn spawn(socket_path: &Path, workspace_root: &Path, once: bool) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_runroom"));
+        let mut command = isolated_command(env!("CARGO_BIN_EXE_runroom"));
         command
             .arg("daemon")
             .arg("--socket")
@@ -1227,7 +1921,7 @@ impl ChildGuard {
     }
 
     fn spawn_with_config(config_home: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_runroom"))
+        let child = isolated_command(env!("CARGO_BIN_EXE_runroom"))
             .args(["daemon", "--once", "--state-file"])
             .arg(
                 config_home

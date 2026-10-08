@@ -6,7 +6,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,9 +20,9 @@ use crate::backend::{BubblewrapRuntimeBackend, NativeRuntimeBackend, RuntimeBack
 use crate::environment::{PROJECT_ENV_KEYS, ProjectEnvironment};
 use crate::model::{
     BindAccess, BindMountSource, EnvironmentVariable, ForegroundCommand, HerdrContext,
-    LaunchHandoff, LaunchRequest, LaunchSpec, LauncherContinuation, PrepareLaunchRequest,
-    PreparedLaunch, ResourceLimits, RuntimeDataFile, RuntimeKind, RuntimePolicy, WorkspaceName,
-    WorkspaceOrigin, WorkspaceSelection,
+    LaunchHandoff, LaunchRequest, LaunchSpec, LauncherContinuation, NetworkMode,
+    PrepareLaunchRequest, PreparedLaunch, ResourceLimits, RuntimeDataFile, RuntimeKind,
+    RuntimePolicy, WorkspaceName, WorkspaceOrigin, WorkspaceSelection,
 };
 use crate::protocol::{ControlOperation, ControlRequest, ControlResult};
 use crate::transport::{connect_control, read_control_response, write_control_request};
@@ -43,6 +44,7 @@ pub struct LauncherConfig {
     environment_allowlist: Vec<String>,
     resume_token: Option<String>,
     continuation_token: Option<String>,
+    mount_arguments: Vec<String>,
 }
 
 impl LauncherConfig {
@@ -66,6 +68,7 @@ impl LauncherConfig {
             environment_allowlist: Vec::new(),
             resume_token: None,
             continuation_token: None,
+            mount_arguments: Vec::new(),
         }
     }
 
@@ -76,7 +79,7 @@ impl LauncherConfig {
         self
     }
 
-    /// Require Herdr launch identity and publish it inside the isolated runtime.
+    /// Require routed Herdr identity; current-terminal launches detect host identity instead.
     #[must_use]
     pub const fn herdr_identity(mut self, enabled: bool) -> Self {
         self.herdr_identity = enabled;
@@ -85,7 +88,7 @@ impl LauncherConfig {
 
     /// Select the exact current directory, or return directory selection to primary.
     #[must_use]
-    pub fn here(mut self, enabled: bool) -> Self {
+    pub fn no_worktree(mut self, enabled: bool) -> Self {
         if enabled {
             self.workspace_selection = WorkspaceSelection::Here;
         } else if matches!(self.workspace_selection, WorkspaceSelection::Here) {
@@ -94,9 +97,9 @@ impl LauncherConfig {
         self
     }
 
-    /// Execute in this terminal without Herdr routing or identity.
+    /// Execute in this terminal without routing, retaining any host Herdr identity.
     #[must_use]
-    pub const fn no_multiplex(mut self, enabled: bool) -> Self {
+    pub const fn here(mut self, enabled: bool) -> Self {
         self.no_multiplex = enabled;
         self
     }
@@ -111,6 +114,13 @@ impl LauncherConfig {
     pub fn project_environment(mut self, enabled: bool, allowlist: Vec<String>) -> Self {
         self.project_environment = enabled;
         self.environment_allowlist = allowlist;
+        self
+    }
+
+    /// Retain normalized CLI-added mount grants across Herdr routing.
+    #[must_use]
+    pub fn mount_arguments(mut self, arguments: Vec<String>) -> Self {
+        self.mount_arguments = arguments;
         self
     }
 
@@ -151,7 +161,7 @@ impl Launcher {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "foreground launch cannot resume a Herdr continuation",
+                "current-terminal launch cannot resume a Herdr continuation",
             ));
         }
         if let Some(token) = self.config.resume_token.as_deref() {
@@ -162,12 +172,9 @@ impl Launcher {
             WorkspaceSelection::Primary,
         );
         let here = matches!(selection, WorkspaceSelection::Here);
-        self.config.herdr_identity = !self.config.no_multiplex
-            && if here {
-                self.config.continuation_token.is_some()
-            } else {
-                self.config.herdr_identity
-            };
+        if !self.config.no_multiplex && here {
+            self.config.herdr_identity = self.config.continuation_token.is_some();
+        }
         let current_directory = env::current_dir()?;
         debug!(
             socket = %self.config.socket_path.display(),
@@ -186,15 +193,8 @@ impl Launcher {
             herdr_identity = self.config.herdr_identity,
             "resolving launch identity"
         );
-        let herdr = if self.config.herdr_identity {
-            Some(HerdrContext {
-                workspace_id: Some(required_herdr_value("HERDR_WORKSPACE_ID")?),
-                pane_id: Some(required_herdr_value("HERDR_PANE_ID")?),
-                session_name: herdr_session_name()?,
-            })
-        } else {
-            None
-        };
+        let herdr = self.herdr_context()?;
+        self.config.herdr_identity = herdr.is_some();
         let continuation = (!self.config.no_multiplex && (here || self.config.herdr_identity))
             .then(|| self.build_handoff())
             .transpose()?;
@@ -210,7 +210,7 @@ impl Launcher {
                 no_multiplex: self.config.no_multiplex,
                 limits: std::mem::take(&mut self.config.limits),
                 herdr,
-                continuation,
+                continuation: continuation.map(Box::new),
                 continuation_token: self.config.continuation_token.clone(),
             }),
         };
@@ -233,7 +233,10 @@ impl Launcher {
                     origin = ?launch.workspace.origin,
                     "daemon prepared launch"
                 );
-                self.execute_foreground(&launch)
+                let ControlOperation::PrepareLaunch(request) = request.operation else {
+                    unreachable!("launcher constructed a launch preparation request");
+                };
+                self.execute_foreground(&launch, request.herdr.as_ref())
             }
             Ok(ControlResult::LaunchRedirected) => Ok(()),
             Ok(_) => Err(io::Error::new(
@@ -244,6 +247,20 @@ impl Launcher {
                 "daemon rejected workspace [{}]: {}",
                 error.code, error.message
             ))),
+        }
+    }
+
+    fn herdr_context(&self) -> io::Result<Option<HerdrContext>> {
+        if self.config.no_multiplex {
+            current_terminal_herdr_context()
+        } else if self.config.herdr_identity {
+            Ok(Some(HerdrContext {
+                workspace_id: Some(required_herdr_value("HERDR_WORKSPACE_ID")?),
+                pane_id: Some(required_herdr_value("HERDR_PANE_ID")?),
+                session_name: herdr_session_name()?,
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -278,6 +295,7 @@ impl Launcher {
         Ok(LaunchHandoff {
             socket_path: self.config.socket_path.clone(),
             command: shell_words::join(words),
+            mount_arguments: self.config.mount_arguments.clone(),
         })
     }
 
@@ -331,12 +349,16 @@ impl Launcher {
             OsString::from("--continuation-token"),
             OsString::from(token),
         ];
+        for argument in continuation.mount_arguments {
+            arguments.push(OsString::from("--mount"));
+            arguments.push(OsString::from(argument));
+        }
         match continuation.workspace {
             WorkspaceSelection::Named(name) => {
                 arguments.push(OsString::from("--name"));
                 arguments.push(OsString::from(name.0));
             }
-            WorkspaceSelection::Here => arguments.push(OsString::from("--here")),
+            WorkspaceSelection::Here => arguments.push(OsString::from("--no-worktree")),
             WorkspaceSelection::Primary => {}
         }
         let error = Command::new(&executable).args(arguments).exec();
@@ -350,7 +372,11 @@ impl Launcher {
     }
 
     #[tracing::instrument(level = "debug", skip_all, name = "execute_foreground")]
-    fn execute_foreground(self, prepared_launch: &PreparedLaunch) -> io::Result<()> {
+    fn execute_foreground(
+        self,
+        prepared_launch: &PreparedLaunch,
+        herdr: Option<&HerdrContext>,
+    ) -> io::Result<()> {
         let workspace = &prepared_launch.workspace;
         let metadata = workspace.path.metadata().map_err(|source| {
             io::Error::new(
@@ -381,33 +407,44 @@ impl Launcher {
                 matches!(mount.source, BindMountSource::Workspace).then_some(mount.access)
             })
             .unwrap_or(BindAccess::ReadOnly);
-        let descriptor = (self.config.herdr_identity && runtime.kind == RuntimeKind::Bubblewrap)
-            .then(|| create_launch_descriptor(prepared_launch, &self.config))
+        let reporting = herdr.filter(|_| runtime.kind == RuntimeKind::Bubblewrap);
+        let activity_socket = reporting
+            .map(|_| projected_activity_socket(&self.config.socket_path, &runtime))
+            .transpose()?
+            .flatten();
+        let descriptor = reporting
+            .map(|herdr| {
+                create_launch_descriptor(
+                    prepared_launch,
+                    &self.config,
+                    herdr,
+                    activity_socket.as_deref(),
+                )
+            })
+            .transpose()?;
+        let companion = reporting
+            .map(|_| create_omp_companion(&runtime))
             .transpose()?;
         let runtime_kind = self.config.runtime.kind;
-        let foreground_executable = self.config.command.executable.clone();
         let launch = LaunchSpec {
             workspace: workspace.clone(),
             runtime,
             command: self.config.command,
             support_mount_access,
         };
-        let prepared = match runtime_kind {
-            RuntimeKind::Native => NativeRuntimeBackend.prepare(&launch),
-            RuntimeKind::Bubblewrap => {
-                let data_files = descriptor
-                    .as_ref()
-                    .map(|file| {
-                        vec![RuntimeDataFile {
-                            descriptor: file.as_raw_fd(),
-                            destination: "/runtime/launch.json",
-                        }]
-                    })
-                    .unwrap_or_default();
-                BubblewrapRuntimeBackend.prepare_with_data_files(&launch, &data_files)
-            }
-        }
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let resolver = (launch.runtime.network == NetworkMode::Private)
+            .then(|| {
+                sealed_runtime_file("runroom-resolv.conf", |file| {
+                    file.write_all(b"nameserver 10.0.2.3\n")
+                })
+            })
+            .transpose()?;
+        let prepared = prepare_runtime(
+            &launch,
+            descriptor.as_ref(),
+            companion.as_ref(),
+            resolver.as_ref(),
+        )?;
         env::set_current_dir(&prepared.working_directory).map_err(|source| {
             io::Error::new(
                 source.kind(),
@@ -425,30 +462,95 @@ impl Launcher {
             runtime = ?runtime_kind,
             network = ?launch.runtime.network,
             mount_count = launch.runtime.bind_mounts.len() + launch.workspace.support_mounts.len(),
-            executable = %foreground_executable.display(),
+            executable = %launch.command.executable.display(),
             "launcher executing foreground command"
         );
-        let mut command = Command::new(&prepared.executable);
-        command.args(&prepared.arguments);
-        if runtime_kind == RuntimeKind::Native {
-            for variable in &launch.runtime.environment {
-                command.env(&variable.name, &variable.value);
+        execute_runtime(&launch, &prepared)
+    }
+}
+
+fn execute_runtime(launch: &LaunchSpec, prepared: &crate::model::PreparedExec) -> io::Result<()> {
+    if launch.runtime.network == NetworkMode::Private {
+        let status = super::network::run(prepared, &launch.command)?;
+        std::process::exit(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+        );
+    }
+    let mut command = Command::new(&prepared.executable);
+    command.args(&prepared.arguments);
+    if launch.runtime.kind == RuntimeKind::Native {
+        for variable in &launch.runtime.environment {
+            command.env(&variable.name, &variable.value);
+        }
+    }
+    let error = command.exec();
+    let message = match launch.runtime.kind {
+        RuntimeKind::Native => format!(
+            "cannot execute foreground command {}: {error}",
+            launch.command.executable.display()
+        ),
+        RuntimeKind::Bubblewrap => format!(
+            "cannot execute Bubblewrap runtime {} for foreground command {}: {error}",
+            prepared.executable.display(),
+            launch.command.executable.display()
+        ),
+    };
+    Err(io::Error::new(error.kind(), message))
+}
+
+fn create_omp_companion(runtime: &RuntimePolicy) -> io::Result<(File, PathBuf)> {
+    let destination = omp_extension_destination(runtime)?;
+    let file = sealed_runtime_file("runroom-agent-state.ts", |file| {
+        file.write_all(include_str!("../../assets/omp/runroom-agent-state.ts").as_bytes())
+    })?;
+    Ok((file, destination))
+}
+
+fn prepare_runtime(
+    launch: &LaunchSpec,
+    descriptor: Option<&File>,
+    companion: Option<&(File, PathBuf)>,
+    resolver: Option<&File>,
+) -> io::Result<crate::model::PreparedExec> {
+    let prepare_bubblewrap = |files: &[RuntimeDataFile<'_>]| {
+        if let Some(resolver) = resolver {
+            BubblewrapRuntimeBackend::prepare_with_private_resolver(
+                launch,
+                files,
+                resolver.as_raw_fd(),
+            )
+        } else {
+            BubblewrapRuntimeBackend::prepare_with_data_files(launch, files)
+        }
+    };
+    match launch.runtime.kind {
+        RuntimeKind::Native => NativeRuntimeBackend.prepare(launch),
+        RuntimeKind::Bubblewrap => {
+            if let Some((descriptor, (companion, destination))) = descriptor.zip(companion) {
+                let destination = destination.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "OMP extension destination is not valid UTF-8",
+                    )
+                })?;
+                prepare_bubblewrap(&[
+                    RuntimeDataFile {
+                        descriptor: descriptor.as_raw_fd(),
+                        destination: "/runtime/launch.json",
+                    },
+                    RuntimeDataFile {
+                        descriptor: companion.as_raw_fd(),
+                        destination,
+                    },
+                ])
+            } else {
+                prepare_bubblewrap(&[])
             }
         }
-        let error = command.exec();
-        let message = match runtime_kind {
-            RuntimeKind::Native => format!(
-                "cannot execute foreground command {}: {error}",
-                foreground_executable.display()
-            ),
-            RuntimeKind::Bubblewrap => format!(
-                "cannot execute Bubblewrap runtime {} for foreground command {}: {error}",
-                prepared.executable.display(),
-                foreground_executable.display()
-            ),
-        };
-        Err(io::Error::new(error.kind(), message))
     }
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "apply_project_environment")]
@@ -501,6 +603,81 @@ fn apply_resolved_environment(
 
 const MAX_IDENTITY_VALUE_BYTES: usize = 255;
 
+fn projected_activity_socket(
+    control_socket: &Path,
+    runtime: &RuntimePolicy,
+) -> io::Result<Option<PathBuf>> {
+    let control_parent = control_socket.parent().unwrap_or_else(|| Path::new(""));
+    let host_socket = std::fs::canonicalize(control_parent)?.join("activity/status.sock");
+    Ok(runtime
+        .bind_mounts
+        .iter()
+        .filter_map(|mount| {
+            let BindMountSource::Host(source) = &mount.source else {
+                return None;
+            };
+            host_socket
+                .strip_prefix(source)
+                .ok()
+                .map(|suffix| (source.components().count(), &mount.destination, suffix))
+        })
+        .max_by_key(|(depth, _, _)| *depth)
+        .map(|(_, destination, suffix)| destination.join(suffix)))
+}
+
+fn omp_extension_destination(runtime: &RuntimePolicy) -> io::Result<PathBuf> {
+    let projected = |name| {
+        runtime
+            .environment
+            .iter()
+            .rev()
+            .find(|variable| variable.name == name)
+            .map(|variable| Path::new(&variable.value))
+    };
+    let agent_directory = if let Some(directory) = projected("PI_CODING_AGENT_DIR") {
+        directory.to_owned()
+    } else {
+        let home = projected("HOME")
+            .or(runtime.home.as_deref())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "OMP companion requires a runtime HOME",
+                )
+            })?;
+        home.join(projected("PI_CONFIG_DIR").unwrap_or_else(|| Path::new(".omp")))
+            .join("agent")
+    };
+    let destination = agent_directory.join("extensions/runroom-agent-state.ts");
+    if !destination.is_absolute()
+        || destination.as_os_str().as_bytes().contains(&0)
+        || destination.as_os_str().as_bytes()[1..]
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "OMP extension destination must be normalized, absolute, and contain no NUL: {}",
+                destination.display()
+            ),
+        ));
+    }
+    Ok(destination)
+}
+
+fn descriptor_herdr_value<'a>(name: &str, value: Option<&'a str>) -> io::Result<&'a str> {
+    validate_identity_value(
+        name,
+        value.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} is required by the prepared Herdr context"),
+            )
+        })?,
+    )
+}
+
 #[derive(Serialize)]
 struct LaunchDescriptor<'a> {
     version: u8,
@@ -510,6 +687,8 @@ struct LaunchDescriptor<'a> {
     workspace: DescriptorWorkspace<'a>,
     agent: DescriptorAgent<'a>,
     herdr: DescriptorHerdr<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_socket: Option<&'a Path>,
 }
 
 #[derive(Serialize)]
@@ -577,16 +756,36 @@ fn herdr_session_name() -> io::Result<Option<String>> {
     Ok(optional_herdr_value("HERDR_SESSION")?.filter(|session| session != "default"))
 }
 
-#[tracing::instrument(level = "debug", skip_all, name = "create_launch_descriptor")]
-fn create_launch_descriptor(launch: &PreparedLaunch, config: &LauncherConfig) -> io::Result<File> {
-    if required_herdr_value("HERDR_ENV")? != "1" {
+fn current_terminal_herdr_context() -> io::Result<Option<HerdrContext>> {
+    let marker = optional_herdr_value("HERDR_ENV")?;
+    let workspace_id = optional_herdr_value("HERDR_WORKSPACE_ID")?;
+    let pane_id = optional_herdr_value("HERDR_PANE_ID")?;
+    let session_name = optional_herdr_value("HERDR_SESSION")?;
+    if marker.is_none() && workspace_id.is_none() && pane_id.is_none() && session_name.is_none() {
+        return Ok(None);
+    }
+    if marker.as_deref() != Some("1") || workspace_id.is_none() || pane_id.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "HERDR_ENV must be 1 for the Herdr identity profile",
+            "current-terminal Herdr identity requires HERDR_ENV=1, HERDR_WORKSPACE_ID, and HERDR_PANE_ID",
         ));
     }
-    let workspace_id = required_herdr_value("HERDR_WORKSPACE_ID")?;
-    let pane_id = required_herdr_value("HERDR_PANE_ID")?;
+    Ok(Some(HerdrContext {
+        workspace_id,
+        pane_id,
+        session_name: session_name.filter(|session| session != "default"),
+    }))
+}
+
+#[tracing::instrument(level = "debug", skip_all, name = "create_launch_descriptor")]
+fn create_launch_descriptor(
+    launch: &PreparedLaunch,
+    config: &LauncherConfig,
+    herdr: &HerdrContext,
+    activity_socket: Option<&Path>,
+) -> io::Result<File> {
+    let workspace_id = descriptor_herdr_value("HERDR_WORKSPACE_ID", herdr.workspace_id.as_deref())?;
+    let pane_id = descriptor_herdr_value("HERDR_PANE_ID", herdr.pane_id.as_deref())?;
     let (kind, name) = match &launch.workspace.selection {
         WorkspaceSelection::Primary => ("primary", None),
         WorkspaceSelection::Named(name) => ("named", Some(name.0.as_str())),
@@ -612,13 +811,14 @@ fn create_launch_descriptor(launch: &PreparedLaunch, config: &LauncherConfig) ->
             origin,
         },
         agent: DescriptorAgent {
-            id: &pane_id,
+            id: pane_id,
             kind: "persistent",
         },
         herdr: DescriptorHerdr {
-            workspace_id: &workspace_id,
-            pane_id: &pane_id,
+            workspace_id,
+            pane_id,
         },
+        activity_socket,
     };
 
     debug!(
@@ -626,11 +826,20 @@ fn create_launch_descriptor(launch: &PreparedLaunch, config: &LauncherConfig) ->
         project = %launch.workspace.project.0,
         "sealing launch descriptor"
     );
-    let descriptor_fd = memfd_create("runroom-launch.json", MFdFlags::MFD_ALLOW_SEALING)
-        .map_err(io::Error::other)?;
+    sealed_runtime_file("runroom-launch.json", |file| {
+        serde_json::to_writer(&mut *file, &descriptor).map_err(io::Error::other)?;
+        file.write_all(b"\n")
+    })
+}
+
+fn sealed_runtime_file(
+    name: &str,
+    write_contents: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<File> {
+    let descriptor_fd =
+        memfd_create(name, MFdFlags::MFD_ALLOW_SEALING).map_err(io::Error::other)?;
     let mut file = File::from(descriptor_fd);
-    serde_json::to_writer(&mut file, &descriptor).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
+    write_contents(&mut file)?;
     file.seek(SeekFrom::Start(0))?;
     fcntl(
         &file,
@@ -696,5 +905,126 @@ mod tests {
                 .iter()
                 .any(|variable| variable.name == "UNRELATED")
         );
+    }
+
+    fn reporting_runtime() -> RuntimePolicy {
+        RuntimePolicy {
+            kind: RuntimeKind::Bubblewrap,
+            network: crate::model::NetworkMode::None,
+            bind_mounts: Vec::new(),
+            devices: Vec::new(),
+            environment: Vec::new(),
+            home: Some(PathBuf::from("/home/sandbox")),
+        }
+    }
+
+    #[test]
+    fn activity_socket_uses_only_the_longest_explicit_host_mount() {
+        let parent = std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let control_socket = parent.join("control.sock");
+        let mut runtime = reporting_runtime();
+        assert_eq!(
+            projected_activity_socket(&control_socket, &runtime).unwrap(),
+            None
+        );
+        runtime.bind_mounts.push(crate::model::BindMount {
+            source: BindMountSource::Host(parent.clone()),
+            destination: PathBuf::from("/runtime/runroom"),
+            access: BindAccess::ReadOnly,
+        });
+        assert_eq!(
+            projected_activity_socket(&control_socket, &runtime).unwrap(),
+            Some(PathBuf::from("/runtime/runroom/activity/status.sock")),
+        );
+        runtime.bind_mounts.push(crate::model::BindMount {
+            source: BindMountSource::Host(parent.join("activity")),
+            destination: PathBuf::from("/runtime/activity"),
+            access: BindAccess::ReadOnly,
+        });
+        assert_eq!(
+            projected_activity_socket(&control_socket, &runtime).unwrap(),
+            Some(PathBuf::from("/runtime/activity/status.sock")),
+        );
+        runtime.bind_mounts[1].source = BindMountSource::Executable(parent.join("activity"));
+        assert_eq!(
+            projected_activity_socket(&control_socket, &runtime).unwrap(),
+            Some(PathBuf::from("/runtime/runroom/activity/status.sock")),
+        );
+    }
+
+    #[test]
+    fn companion_uses_projected_agent_directory_configuration() {
+        let mut runtime = reporting_runtime();
+        assert_eq!(
+            omp_extension_destination(&runtime).unwrap(),
+            Path::new("/home/sandbox/.omp/agent/extensions/runroom-agent-state.ts"),
+        );
+        runtime.environment.extend([
+            EnvironmentVariable {
+                name: "HOME".into(),
+                value: "/projected/home".into(),
+            },
+            EnvironmentVariable {
+                name: "PI_CONFIG_DIR".into(),
+                value: ".custom-omp".into(),
+            },
+        ]);
+        assert_eq!(
+            omp_extension_destination(&runtime).unwrap(),
+            Path::new("/projected/home/.custom-omp/agent/extensions/runroom-agent-state.ts"),
+        );
+        runtime.environment.push(EnvironmentVariable {
+            name: "PI_CODING_AGENT_DIR".into(),
+            value: "/custom/agent".into(),
+        });
+        assert_eq!(
+            omp_extension_destination(&runtime).unwrap(),
+            Path::new("/custom/agent/extensions/runroom-agent-state.ts"),
+        );
+        runtime.environment.push(EnvironmentVariable {
+            name: "PI_CODING_AGENT_DIR".into(),
+            value: "/last/agent".into(),
+        });
+        assert_eq!(
+            omp_extension_destination(&runtime).unwrap(),
+            Path::new("/last/agent/extensions/runroom-agent-state.ts"),
+        );
+    }
+
+    #[test]
+    fn companion_rejects_nonabsolute_and_unnormalized_runtime_destinations() {
+        for directory in [
+            "relative",
+            "/home/../agent",
+            "/home/./agent",
+            "/home//agent",
+            "/home/\0agent",
+        ] {
+            let mut runtime = reporting_runtime();
+            runtime.environment.push(EnvironmentVariable {
+                name: "PI_CODING_AGENT_DIR".into(),
+                value: directory.into(),
+            });
+            assert!(
+                omp_extension_destination(&runtime).is_err(),
+                "{directory:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_runtime_files_reject_writes_and_resizing() {
+        let mut file =
+            sealed_runtime_file("sealed-test", |file| file.write_all(b"immutable")).unwrap();
+        assert_eq!(
+            file.write_all(b"changed").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        for length in [1, 32] {
+            assert_eq!(
+                file.set_len(length).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
     }
 }

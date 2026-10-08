@@ -1,16 +1,25 @@
-# --here runs the exact current directory (including outside Git), not the project root,
-# and creates no Git worktree. It ignores launcher.name and conflicts with --name.
-# Default --here routing opens a new tab in the default Herdr session's active workspace.
-# That session must be running with an active workspace; there is no silent foreground fallback.
-# --no-multiplex runs in the current terminal without Herdr routing or identity,
-# with either --here or regular workspace selection.
-# The selected profile, command and resource limits still apply; -c overrides only command.
-# Bubblewrap --here replaces @workspace mappings with a writable /workspace bind.
-# Explicit host-source profile mounts remain permissions; native mode does not confine files.
-# Neither flag silently changes the configured runtime.
-# Examples: runroom --profile omp --here
-#           runroom --profile omp --here --no-multiplex
-# -c overrides only the command; it does not change the selected profile's mounts.
+# install/update run cargo install only; replace-config explicitly overwrites config.
+# Executable mounts resolve bare names against the launcher's PATH. They keep the
+# canonical file location plus an alias under /opt/runroom/bin, prepended to sandbox PATH.
+# Script/package resources still need their own directory mounts.
+# required = false permits an executable to be absent; otherwise lookup failure stops launch.
+# Mount destinations and daemon state/workspace paths also accept ~.
+# Other host paths accept ~. Omitted mount destinations use the expanded source path.
+# Named Herdr discovery uses the daemon's PATH, not a hard-coded installation path.
+# --here runs in the current shell/pane, retaining its Herdr identity when present.
+# --no-worktree uses the exact current directory; combine with --here to avoid a new tab.
+# network = "host" shares host interfaces/sockets; "none" denies external networking.
+# "private" hides host interfaces/sockets but permits IPv4 internet/LAN access via slirp4netns.
+# Private requires Bubblewrap, slirp4netns on host PATH, and /dev/net/tun; startup waits for readiness.
+# No host network/firewall changes; no IPv6 forwarding or named shared networks. "outbound" is future work.
+# Devices accept { path = "/dev/ttyUSB0" } or { class = "drm" }; required defaults true.
+# required = false permits absence. Classes are discovered at launch, not on hotplug.
+# Device grants permit hardware operations and expose read-only hardware/module sysfs;
+# they are not monitor-only permissions. Native mode cannot confine device access.
+# launcher.base is abstract and inherited by every runnable profile.
+# Scalars replace; collections merge by key, with profile entries taking precedence.
+# Explicit [] / {} clears an inherited collection. There is no shell interpolation.
+
 runtime = "bubblewrap"
 socket = "/run/user/@UID@/runroom/control.sock"
 
@@ -18,59 +27,13 @@ socket = "/run/user/@UID@/runroom/control.sock"
 profile = "pi"
 verbose = false
 
-[launcher.profiles.pi]
-command = "/usr/bin/node @HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+# Shared by every runnable profile; cannot be launched directly.
+[launcher.base]
 project_environment = true
 identity = "herdr"
 network = "host"
-# Explicit device grants are Bubblewrap-only; native execution cannot confine
-# devices and rejects nonempty devices configuration. Every grant is a single
-# character/block node via --dev-bind, never the host /dev directory.
-# Select exactly one path or class per entry; required defaults to true:
-# devices = [{ path = "/dev/ttyUSB0" }, { class = "drm", required = false }]
-# Individual paths must be normalized absolute /dev nodes; symlink aliases are
-# retained inside the sandbox while their host sources are canonicalized.
-# Generic classes discover /sys/class/<class> uevent DEVNAME nodes, including
-# nested entries (e.g. input events). Overlapping grants are deduplicated.
-# Discovery happens at launch, not on hotplug; restart to discover new devices.
-# required = false allows absent nodes/classes, not permission or other IO errors.
-# Required missing nodes/classes fail launch. Classes grant ALL discovered nodes;
-# driver/device access expands the kernel attack surface and may grant hardware,
-# raw storage, input, or GPU access. Host ownership/permissions still apply.
-# Grants permit device operations, not just monitoring; there is no read-only
-# ioctl filter, GPU reservation, or Docker-style device-cgroup policy.
-# NVIDIA is deliberately always enabled for both shipped profiles, including
-# nvidia-smi: GPU indices, control/modeset/UVM nodes and nvidia-caps nodes only.
-# No NVIDIA driver nodes means launch fails; make the class optional explicitly
-# if absence is acceptable. Devices alone do not install/load the host driver.
-# For one NVIDIA GPU, explicit paths also need companion driver nodes (at least
-# /dev/nvidiactl for NVML; CUDA may need UVM). The nvidia class grants all GPUs.
-# nvidia-smi and its matching driver libraries must exist in the sandbox's /usr
-# (the existing read-only /usr projection supplies host files there). Device
-# grants also expose /sys/{block,bus,class,dev,devices,module} read-only for
-# NVML/sysfs discovery, revealing host hardware and module metadata without
-# exposing /sys/kernel, /sys/firmware or /sys/fs. Without driver files or the
-# required sysfs information, nvidia-smi may fail.
-# Related device-grant models (these are not Flatpak aliases or Docker CDI):
-# https://docs.flatpak.org/en/latest/sandbox-permissions.html
-# https://docs.docker.com/reference/cli/docker/container/run/#device
-# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
-devices = [{ class = "nvidia" }]
-# CPU placement restricts this instance and every descendant through systemd AllowedCPUs.
-# Choose ONE: a count of logical CPUs or a nonempty, unique list of logical CPU IDs.
-# cpu_count selects the lowest available IDs; IDs must be available to the runtime leader.
-# This is not a CPU-time quota or exclusive reservation: instances may share the same CPUs.
-# For two CPUs per instance (the same lowest pair can be used by every instance):
-# cpu_count = 2
-# Or for the same eight logical CPUs shared by every instance (if these IDs are available):
-# cpu_cores = [0, 1, 2, 3, 4, 5, 6, 7]
-# Valid counts: 1..1024. Valid IDs: 0..1023. CLI --cpu-count or --cpu-cores replaces both.
-# Requires cgroup v2 cpuset support/delegation; launch fails if EffectiveCPUs does not match.
-# Upgrade both the launcher binary and daemon together (control protocol 10).
-# Existing per-instance resource controls, independently combinable with CPU placement:
-# memory_max_bytes = 8589934592 # 8 GiB hard cgroup memory limit
-# tasks_max = 512 # Processes and threads combined
-# cpu_quota_basis_points = 20000 # Two CPUs' worth of time, not a placement restriction
+cpu_cores = [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+memory_max_bytes = 8589934592
 environment = [
   "TERM",
   "COLORTERM",
@@ -90,84 +53,56 @@ environment = [
   "RUNROOM_STATE_DIR",
   "RUNROOM_INITIAL_PROFILE",
 ]
+bind_mounts = [
+  # Workspace
+  { source = "@workspace", destination = "/workspace", access = "rw" },
+
+  # Runroom
+  { executable = "runroom", access = "ro" },
+  { source = "~/.cache/runroom", access = "rw" },
+  { source = "~/.local/state/runroom/workflow", access = "rw" },
+  { source = "/run/user/@UID@/runroom/activity", destination = "/runtime/runroom", access = "ro" },
+
+  # Plannotator
+  { executable = "plannotator", access = "ro" },
+  { source = "~/.local/share/plannotator", access = "rw" },
+
+  # Shared tools and configuration
+  { source = "~/.agents/skills", access = "ro" },
+  { source = "~/.gitconfig", access = "ro" },
+  { source = "~/.config/git", access = "ro" },
+  { source = "~/.cargo/bin", destination = "/cargo/bin", access = "ro" },
+]
+devices = [{ class = "nvidia" }]
 set_environment = {
-  PATH = "@HOME@/.local/bin:/usr/local/bin:/usr/bin",
+  PATH = "/usr/local/bin:/usr/bin:/bin:/cargo/bin",
   LANG = "C.UTF-8",
   LC_ALL = "C.UTF-8",
   HERDR_ENV = "1",
   XDG_RUNTIME_DIR = "/run/user/@UID@",
 }
+
+# Optional shell profile; Pi remains the default selection above.
+[launcher.profiles.default]
+command = "/bin/bash"
+
+[launcher.profiles.pi]
+command = "pi"
 bind_mounts = [
-  { source = "@workspace", destination = "/workspace", access = "rw" },
-  { source = "@HOME@/.pi/agent", destination = "@HOME@/.pi/agent", access = "rw" },
-  { source = "@HOME@/.pi/local-extensions", destination = "@HOME@/.pi/local-extensions", access = "ro" },
-  { source = "@HOME@/.agents/skills", destination = "@HOME@/.agents/skills", access = "ro" },
-  { source = "@HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent", destination = "@HOME@/.local/lib/node_modules/@earendil-works/pi-coding-agent", access = "ro" },
-  { source = "@RUNROOM_BINARY@", destination = "@HOME@/.local/bin/runroom", access = "ro" },
-  { source = "@HOME@/.local/bin/plannotator", destination = "@HOME@/.local/bin/plannotator", access = "ro" },
-  { source = "@HOME@/.local/state/runroom/workflow", destination = "@HOME@/.local/state/runroom/workflow", access = "rw" },
-  { source = "@HOME@/.cache/runroom", destination = "@HOME@/.cache/runroom", access = "rw" },
-  { source = "@HOME@/.local/share/plannotator", destination = "@HOME@/.local/share/plannotator", access = "rw" },
-  { source = "@HOME@/.gitconfig", destination = "@HOME@/.gitconfig", access = "ro" },
-  { source = "@HOME@/.config/git", destination = "@HOME@/.config/git", access = "ro" },
-  { source = "/run/user/@UID@/runroom/activity", destination = "/runtime/runroom", access = "ro" },
+  { executable = "pi", access = "ro" },
+  { source = "~/.pi/agent", access = "rw" },
+  { source = "~/.pi/local-extensions", access = "ro" },
+  { source = "~/.local/lib/node_modules/@earendil-works/pi-coding-agent", access = "ro" },
 ]
 
-# Standalone OMP installation. /opt/omp is inside the sandbox, not a host install.
-# Its executable is read-only; only its agent state and the workspace are writable.
 [launcher.profiles.omp]
-command = "/opt/omp"
-project_environment = true
-identity = "herdr"
-network = "host"
-# Same explicit NVIDIA access, required-node behavior, /usr driver-file and
-# read-only sysfs dependencies, and security implications as the pi profile.
-devices = [{ class = "nvidia" }]
-environment = [
-  "TERM",
-  "COLORTERM",
-  "HERDR_WORKSPACE_ID",
-  "HERDR_PANE_ID",
-  "RUNROOM_DATABASE_URL",
-  "RUNROOM_MODEL_CACHE_DIR",
-  "RUNROOM_POSTGRES_DB",
-  "RUNROOM_POSTGRES_PASSWORD",
-  "RUNROOM_POSTGRES_PORT",
-  "RUNROOM_POSTGRES_USER",
-  "RUNROOM_QDRANT_API_KEY",
-  "RUNROOM_QDRANT_COLLECTION",
-  "RUNROOM_QDRANT_GRPC_PORT",
-  "RUNROOM_QDRANT_HTTP_PORT",
-  "RUNROOM_QDRANT_URL",
-  "RUNROOM_STATE_DIR",
-]
-set_environment = {
-  PATH = "@HOME@/.local/bin:/usr/local/bin:/usr/bin:/opt",
-  LANG = "C.UTF-8",
-  LC_ALL = "C.UTF-8",
-}
+command = "omp"
 bind_mounts = [
-  { source = "@workspace", destination = "/workspace", access = "rw" },
-  { source = "@HOME@/.cache/.bun/bin/omp", destination = "/opt/omp", access = "ro" },
-  { source = "@HOME@/.omp/agent", destination = "@HOME@/.omp/agent", access = "rw" },
-  { source = "@HOME@/.agents/skills", destination = "@HOME@/.agents/skills", access = "ro" },
-  { source = "@RUNROOM_BINARY@", destination = "@HOME@/.local/bin/runroom", access = "ro" },
-  { source = "@HOME@/.gitconfig", destination = "@HOME@/.gitconfig", access = "ro" },
-  { source = "@HOME@/.config/git", destination = "@HOME@/.config/git", access = "ro" },
-  { source = "/run/user/@UID@/runroom/activity", destination = "/runtime/runroom", access = "ro" },
+  { executable = "omp", access = "ro" },
+  { source = "~/.omp/agent", access = "rw" },
 ]
-
 
 [daemon]
-state_file = "@HOME@/.local/state/runroom/instances.json"
-workspace_root = "@HOME@/.local/share/runroom/workspaces"
+state_file = "~/.local/state/runroom/instances.json"
+workspace_root = "~/.local/share/runroom/workspaces"
 verbose = false
-
-# The canonical state_file path defines the daemon's stable scope ownership.
-# Only one daemon may hold that registry, even when different sockets are used.
-# Existing recorded legacy scopes remain manageable; unrelated scopes are untouched.
-# Scalar ceilings also supply omitted per-launch limits. CPU placement is independent.
-# [daemon.resource_ceiling]
-# memory_max_bytes = 17179869184
-# tasks_max = 1024
-# cpu_quota_basis_points = 40000

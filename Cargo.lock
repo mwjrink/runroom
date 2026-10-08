@@ -711,7 +711,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runroom"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "nix",
@@ -719,6 +719,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "shell-words",
+ "signal-hook",
+ "tempfile",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -832,6 +834,16 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
 
 [[package]]
 name = "signal-hook-registry"

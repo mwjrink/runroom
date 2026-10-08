@@ -17,8 +17,7 @@ use crate::model::{
     WorkspaceSelection, WorkspaceSupportMount,
 };
 use crate::protocol::{
-    ControlError, ControlOperation, ControlRequest, ControlResponse, ControlResult,
-    PROTOCOL_VERSION, ProtocolVersion,
+    APP_VERSION, ControlError, ControlOperation, ControlRequest, ControlResponse, ControlResult,
 };
 
 const MAGIC: [u8; 4] = *b"RRM\0";
@@ -26,13 +25,14 @@ const CLIENT_HELLO_KIND: u8 = 1;
 const DAEMON_HELLO_KIND: u8 = 2;
 const REQUEST_KIND: u8 = 3;
 const RESPONSE_KIND: u8 = 4;
-const CLIENT_HELLO_LEN: usize = 9;
-const DAEMON_HELLO_LEN: usize = 10;
+const MAX_VERSION_LEN: usize = 128;
+const MAX_HELLO_LEN: usize = 6 + MAX_VERSION_LEN;
 const MAX_CONTROL_FRAME_LEN: usize = 768 * 1024;
 const MAX_PATH_LEN: usize = 16 * 1024;
 const MAX_NAME_LEN: usize = 255;
 const MAX_COMMAND_LEN: usize = 64 * 1024;
 const MAX_SUPPORT_MOUNTS: usize = 32;
+const MAX_MOUNT_ARGUMENTS: usize = 128;
 const MAX_DIAGNOSTIC_LEN: usize = 4 * 1024;
 const MAX_LIST_LIMIT: u16 = 100;
 const MAX_MEMORY_BYTES: u64 = 1 << 50;
@@ -46,9 +46,9 @@ pub(crate) enum HandshakeStatus {
     UnsupportedVersion,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonHello {
-    pub version: ProtocolVersion,
+    pub version: String,
     pub status: HandshakeStatus,
 }
 
@@ -62,71 +62,92 @@ pub(crate) fn connect_control(socket_path: &Path) -> io::Result<UnixStream> {
     }
     let mut stream = UnixStream::connect(socket_path)?;
     configure_stream(&stream)?;
-    write_client_hello(&mut stream, PROTOCOL_VERSION)?;
+    write_client_hello(&mut stream, APP_VERSION)?;
     let daemon = read_daemon_hello(&mut stream)?;
     if daemon.status != HandshakeStatus::Accepted {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "daemon protocol {}.{} does not support client protocol {}.{}",
-                daemon.version.major,
-                daemon.version.minor,
-                PROTOCOL_VERSION.major,
-                PROTOCOL_VERSION.minor
+                "daemon version {} does not support client version {APP_VERSION}",
+                daemon.version,
             ),
         ));
     }
-    if daemon.version.major != PROTOCOL_VERSION.major {
+    if daemon.version != APP_VERSION {
         return Err(invalid_data(
-            "daemon accepted an incompatible protocol major",
+            "daemon accepted a different application version",
         ));
     }
     Ok(stream)
 }
 
-pub(crate) fn write_client_hello(
+pub(crate) fn write_client_hello(stream: &mut UnixStream, version: &str) -> io::Result<()> {
+    write_hello(stream, CLIENT_HELLO_KIND, version, None)
+}
+
+pub(crate) fn read_client_hello(stream: &mut UnixStream) -> io::Result<String> {
+    let (payload, len) = read_hello(stream, CLIENT_HELLO_KIND, 5)?;
+    decode_version(&payload[5..len])
+}
+
+pub(crate) fn write_daemon_hello(
     stream: &mut UnixStream,
-    version: ProtocolVersion,
+    version: &str,
+    status: HandshakeStatus,
 ) -> io::Result<()> {
-    let mut payload = [0_u8; CLIENT_HELLO_LEN];
-    payload[..4].copy_from_slice(&MAGIC);
-    payload[4] = CLIENT_HELLO_KIND;
-    payload[5..7].copy_from_slice(&version.major.to_be_bytes());
-    payload[7..9].copy_from_slice(&version.minor.to_be_bytes());
-    write_fixed_payload(stream, &payload)
-}
-
-pub(crate) fn read_client_hello(stream: &mut UnixStream) -> io::Result<ProtocolVersion> {
-    let payload = read_fixed_payload::<CLIENT_HELLO_LEN>(stream)?;
-    validate_header(&payload, CLIENT_HELLO_KIND)?;
-    Ok(decode_version(&payload))
-}
-
-pub(crate) fn write_daemon_hello(stream: &mut UnixStream, hello: DaemonHello) -> io::Result<()> {
-    let mut payload = [0_u8; DAEMON_HELLO_LEN];
-    payload[..4].copy_from_slice(&MAGIC);
-    payload[4] = DAEMON_HELLO_KIND;
-    payload[5..7].copy_from_slice(&hello.version.major.to_be_bytes());
-    payload[7..9].copy_from_slice(&hello.version.minor.to_be_bytes());
-    payload[9] = match hello.status {
+    let status = match status {
         HandshakeStatus::Accepted => 0,
         HandshakeStatus::UnsupportedVersion => 1,
     };
-    write_fixed_payload(stream, &payload)
+    write_hello(stream, DAEMON_HELLO_KIND, version, Some(status))
 }
 
 pub(crate) fn read_daemon_hello(stream: &mut UnixStream) -> io::Result<DaemonHello> {
-    let payload = read_fixed_payload::<DAEMON_HELLO_LEN>(stream)?;
-    validate_header(&payload, DAEMON_HELLO_KIND)?;
-    let status = match payload[9] {
+    let (payload, len) = read_hello(stream, DAEMON_HELLO_KIND, 6)?;
+    let status = match payload[5] {
         0 => HandshakeStatus::Accepted,
         1 => HandshakeStatus::UnsupportedVersion,
         value => return Err(invalid_data(format!("unknown handshake status {value}"))),
     };
     Ok(DaemonHello {
-        version: decode_version(&payload),
+        version: decode_version(&payload[6..len])?,
         status,
     })
+}
+
+fn write_hello(
+    stream: &mut UnixStream,
+    kind: u8,
+    version: &str,
+    status: Option<u8>,
+) -> io::Result<()> {
+    validate_version(version).map_err(invalid_input)?;
+    let mut payload = [0_u8; MAX_HELLO_LEN];
+    payload[..4].copy_from_slice(&MAGIC);
+    payload[4] = kind;
+    let offset = if let Some(status) = status {
+        payload[5] = status;
+        6
+    } else {
+        5
+    };
+    payload[offset..offset + version.len()].copy_from_slice(version.as_bytes());
+    write_frame(stream, &payload[..offset + version.len()])
+}
+
+fn read_hello(
+    stream: &mut UnixStream,
+    expected_kind: u8,
+    header_len: usize,
+) -> io::Result<([u8; MAX_HELLO_LEN], usize)> {
+    let len = read_frame_length(stream)?;
+    if len <= header_len || len > header_len + MAX_VERSION_LEN {
+        return Err(invalid_data("invalid version handshake frame length"));
+    }
+    let mut payload = [0_u8; MAX_HELLO_LEN];
+    stream.read_exact(&mut payload[..len])?;
+    validate_header(&payload[..len], expected_kind)?;
+    Ok((payload, len))
 }
 
 pub(crate) fn write_control_request(
@@ -175,23 +196,14 @@ fn bound_wire_response(response: &mut WireResponse) -> io::Result<()> {
     }
 }
 
-fn write_fixed_payload<const N: usize>(
-    stream: &mut UnixStream,
-    payload: &[u8; N],
-) -> io::Result<()> {
-    write_frame(stream, payload)
-}
-
-fn read_fixed_payload<const N: usize>(stream: &mut UnixStream) -> io::Result<[u8; N]> {
-    let actual_len = read_frame_length(stream)?;
-    if actual_len != N {
-        return Err(invalid_data(format!(
-            "unexpected frame length {actual_len}; expected {N}"
-        )));
+fn validate_version(version: &str) -> Result<(), &'static str> {
+    if version.is_empty()
+        || version.len() > MAX_VERSION_LEN
+        || !version.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err("invalid application version");
     }
-    let mut payload = [0_u8; N];
-    stream.read_exact(&mut payload)?;
-    Ok(payload)
+    Ok(())
 }
 
 fn write_json_frame<T: Serialize>(stream: &mut UnixStream, kind: u8, value: &T) -> io::Result<()> {
@@ -248,11 +260,10 @@ fn validate_header(payload: &[u8], expected_kind: u8) -> io::Result<()> {
     Ok(())
 }
 
-fn decode_version(payload: &[u8]) -> ProtocolVersion {
-    ProtocolVersion {
-        major: u16::from_be_bytes([payload[5], payload[6]]),
-        minor: u16::from_be_bytes([payload[7], payload[8]]),
-    }
+fn decode_version(payload: &[u8]) -> io::Result<String> {
+    let version = std::str::from_utf8(payload).map_err(invalid_data)?;
+    validate_version(version).map_err(invalid_data)?;
+    Ok(version.to_owned())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -273,7 +284,7 @@ enum WireRequestOperation {
         limits: WireResourceLimits,
         herdr: Option<WireHerdrContext>,
         no_multiplex: bool,
-        continuation: Option<WireLaunchHandoff>,
+        continuation: Option<Box<WireLaunchHandoff>>,
         continuation_token: Option<String>,
     },
     ResumeLaunch {
@@ -400,11 +411,9 @@ impl TryFrom<WireRequest> for ControlRequest {
                 if let Some(token) = continuation_token.as_deref() {
                     validate_name(token, "continuation token")?;
                 }
-                if no_multiplex
-                    && (herdr.is_some() || continuation.is_some() || continuation_token.is_some())
-                {
+                if no_multiplex && (continuation.is_some() || continuation_token.is_some()) {
                     return Err(invalid_data(
-                        "foreground launch cannot contain Herdr metadata",
+                        "current-terminal launch cannot contain Herdr routing metadata",
                     ));
                 }
                 ControlOperation::PrepareLaunch(PrepareLaunchRequest {
@@ -416,7 +425,9 @@ impl TryFrom<WireRequest> for ControlRequest {
                     limits,
                     herdr,
                     no_multiplex,
-                    continuation: continuation.map(model_handoff).transpose()?,
+                    continuation: continuation
+                        .map(|handoff| model_handoff(*handoff).map(Box::new))
+                        .transpose()?,
                     continuation_token,
                 })
             }
@@ -522,6 +533,7 @@ enum WireResult {
 struct WireLaunchHandoff {
     socket_path: Vec<u8>,
     command: String,
+    mount_arguments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -532,6 +544,7 @@ struct WireLauncherContinuation {
     here: bool,
     profile: String,
     command: String,
+    mount_arguments: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -854,12 +867,10 @@ fn wire_prepare_launch(request: &PrepareLaunchRequest) -> io::Result<WireRequest
         validate_name(token, "continuation token")?;
     }
     if request.no_multiplex
-        && (request.herdr.is_some()
-            || request.continuation.is_some()
-            || request.continuation_token.is_some())
+        && (request.continuation.is_some() || request.continuation_token.is_some())
     {
         return Err(invalid_input(
-            "foreground launch cannot contain Herdr metadata",
+            "current-terminal launch cannot contain Herdr routing metadata",
         ));
     }
     Ok(WireRequestOperation::PrepareLaunch {
@@ -877,8 +888,8 @@ fn wire_prepare_launch(request: &PrepareLaunchRequest) -> io::Result<WireRequest
         no_multiplex: request.no_multiplex,
         continuation: request
             .continuation
-            .as_ref()
-            .map(wire_handoff)
+            .as_deref()
+            .map(|handoff| wire_handoff(handoff).map(Box::new))
             .transpose()?,
         continuation_token: request.continuation_token.clone(),
     })
@@ -890,9 +901,11 @@ fn wire_handoff(handoff: &LaunchHandoff) -> io::Result<WireLaunchHandoff> {
         return Err(invalid_input("continuation socket must be absolute"));
     }
     validate_command(&handoff.command)?;
+    validate_mount_arguments(&handoff.mount_arguments)?;
     Ok(WireLaunchHandoff {
         socket_path: handoff.socket_path.as_os_str().as_bytes().to_vec(),
         command: handoff.command.clone(),
+        mount_arguments: handoff.mount_arguments.clone(),
     })
 }
 
@@ -902,9 +915,12 @@ fn model_handoff(handoff: WireLaunchHandoff) -> io::Result<LaunchHandoff> {
         return Err(invalid_data("continuation socket must be absolute"));
     }
     validate_command(&handoff.command)?;
+    validate_mount_arguments(&handoff.mount_arguments)
+        .map_err(|error| invalid_data(error.to_string()))?;
     Ok(LaunchHandoff {
         socket_path,
         command: handoff.command,
+        mount_arguments: handoff.mount_arguments,
     })
 }
 
@@ -916,12 +932,14 @@ fn wire_continuation(continuation: &LauncherContinuation) -> io::Result<WireLaun
     let name = selection_name(&continuation.workspace)?;
     validate_name(&continuation.profile, "continuation profile")?;
     validate_command(&continuation.command)?;
+    validate_mount_arguments(&continuation.mount_arguments)?;
     Ok(WireLauncherContinuation {
         socket_path: continuation.socket_path.as_os_str().as_bytes().to_vec(),
         name,
         here: matches!(continuation.workspace, WorkspaceSelection::Here),
         profile: continuation.profile.clone(),
         command: continuation.command.clone(),
+        mount_arguments: continuation.mount_arguments.clone(),
     })
 }
 
@@ -932,11 +950,14 @@ fn model_continuation(continuation: WireLauncherContinuation) -> io::Result<Laun
     }
     validate_name(&continuation.profile, "continuation profile")?;
     validate_command(&continuation.command)?;
+    validate_mount_arguments(&continuation.mount_arguments)
+        .map_err(|error| invalid_data(error.to_string()))?;
     Ok(LauncherContinuation {
         socket_path,
         workspace: name_to_selection(continuation.name, continuation.here)?,
         profile: continuation.profile,
         command: continuation.command,
+        mount_arguments: continuation.mount_arguments,
     })
 }
 
@@ -1184,6 +1205,39 @@ fn name_to_selection(name: Option<String>, here: bool) -> io::Result<WorkspaceSe
     }
 }
 
+fn validate_mount_arguments(arguments: &[String]) -> io::Result<()> {
+    if arguments.len() > MAX_MOUNT_ARGUMENTS {
+        return Err(invalid_input("too many continuation mounts"));
+    }
+    for argument in arguments {
+        let (paths, access) = argument
+            .rsplit_once(':')
+            .ok_or_else(|| invalid_input("continuation mount requires explicit access"))?;
+        if !matches!(access, "ro" | "rw") {
+            return Err(invalid_input("invalid continuation mount access"));
+        }
+        let (source, destination) = paths
+            .rsplit_once('@')
+            .ok_or_else(|| invalid_input("continuation mount requires a destination"))?;
+        for path in [source, destination] {
+            validate_path(OsStr::new(path))?;
+            if !Path::new(path).is_absolute()
+                || Path::new(path).components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    )
+                })
+            {
+                return Err(invalid_input(
+                    "continuation mount paths must be absolute and normalized",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_name(name: &str, field: &str) -> io::Result<()> {
     if name.is_empty() || name.len() > MAX_NAME_LEN || name.chars().any(char::is_control) {
         return Err(invalid_input(format!(
@@ -1397,13 +1451,73 @@ mod tests {
                 limits: ResourceLimits::default(),
                 herdr: None,
                 no_multiplex: false,
-                continuation: Some(LaunchHandoff {
+                continuation: Some(Box::new(LaunchHandoff {
                     socket_path: PathBuf::from("/run/runroom/control.sock"),
                     command: "printf directory".to_owned(),
-                }),
+                    mount_arguments: Vec::new(),
+                })),
                 continuation_token: None,
             }),
         }
+    }
+
+    #[test]
+    fn continuation_mounts_reject_malformed_and_oversized_inputs_at_both_boundaries() {
+        let oversized_path = format!("/{}", "x".repeat(MAX_PATH_LEN));
+        let cases = [
+            vec!["/source@/destination".to_owned()],
+            vec!["/source@/destination:invalid".to_owned()],
+            vec!["relative@/destination:ro".to_owned()],
+            vec!["/source@relative:rw".to_owned()],
+            vec!["/source@/destination/../escape:ro".to_owned()],
+            vec!["/source\0@/destination:ro".to_owned()],
+            vec![format!("{oversized_path}@/destination:ro")],
+            vec![format!("/source@{oversized_path}:rw")],
+            vec!["/source@/destination:ro".to_owned(); MAX_MOUNT_ARGUMENTS + 1],
+        ];
+        for mount_arguments in cases {
+            let handoff = LaunchHandoff {
+                socket_path: PathBuf::from("/run/runroom/control.sock"),
+                command: "true".to_owned(),
+                mount_arguments: mount_arguments.clone(),
+            };
+            assert!(wire_handoff(&handoff).is_err());
+            assert_eq!(
+                model_handoff(WireLaunchHandoff {
+                    socket_path: b"/run/runroom/control.sock".to_vec(),
+                    command: "true".to_owned(),
+                    mount_arguments: mount_arguments.clone(),
+                })
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+            let continuation = LauncherContinuation {
+                socket_path: handoff.socket_path,
+                workspace: WorkspaceSelection::Here,
+                profile: "sandbox".to_owned(),
+                command: handoff.command,
+                mount_arguments: mount_arguments.clone(),
+            };
+            assert!(wire_continuation(&continuation).is_err());
+            assert_eq!(
+                model_continuation(WireLauncherContinuation {
+                    socket_path: b"/run/runroom/control.sock".to_vec(),
+                    name: None,
+                    here: true,
+                    profile: "sandbox".to_owned(),
+                    command: "true".to_owned(),
+                    mount_arguments,
+                })
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        validate_mount_arguments(&[
+            "/source@with:punctuation@/destination:with:colon:ro".to_owned()
+        ])
+        .expect("source @ and path colons are valid");
     }
 
     #[test]
@@ -1423,6 +1537,7 @@ mod tests {
             here: true,
             profile: "native".to_owned(),
             command: "true".to_owned(),
+            mount_arguments: Vec::new(),
         };
         assert!(model_continuation(continuation).is_err());
 
@@ -1465,35 +1580,43 @@ mod tests {
     }
 
     #[test]
-    fn foreground_requests_reject_herdr_metadata_on_both_boundaries() {
+    fn current_terminal_requests_allow_identity_but_reject_routing_on_both_boundaries() {
         let mut request = directory_request();
         let ControlOperation::PrepareLaunch(launch) = &mut request.operation else {
             unreachable!()
         };
         launch.continuation = None;
         launch.no_multiplex = true;
-        let bytes =
-            serde_json::to_vec(&WireRequest::try_from(&request).expect("encode foreground"))
-                .expect("serialize foreground");
-        let wire: WireRequest = serde_json::from_slice(&bytes).expect("deserialize foreground");
-        assert_eq!(
-            ControlRequest::try_from(wire).expect("decode foreground"),
-            request
-        );
+        for herdr in [
+            None,
+            Some(HerdrContext {
+                session_name: Some("named".to_owned()),
+                workspace_id: Some("workspace".to_owned()),
+                pane_id: Some("pane".to_owned()),
+            }),
+        ] {
+            let ControlOperation::PrepareLaunch(launch) = &mut request.operation else {
+                unreachable!()
+            };
+            launch.herdr = herdr;
+            let bytes = serde_json::to_vec(
+                &WireRequest::try_from(&request).expect("encode current terminal"),
+            )
+            .expect("serialize current terminal");
+            let wire: WireRequest =
+                serde_json::from_slice(&bytes).expect("deserialize current terminal");
+            assert_eq!(
+                ControlRequest::try_from(wire).expect("decode current terminal"),
+                request
+            );
+        }
 
-        for field in ["herdr", "continuation", "continuation_token"] {
+        for field in ["continuation", "continuation_token"] {
             let mut malformed_request = request.clone();
             let ControlOperation::PrepareLaunch(launch) = &mut malformed_request.operation else {
                 unreachable!()
             };
             match field {
-                "herdr" => {
-                    launch.herdr = Some(HerdrContext {
-                        session_name: None,
-                        workspace_id: Some("workspace".to_owned()),
-                        pane_id: Some("pane".to_owned()),
-                    });
-                }
                 "continuation" => {
                     let ControlOperation::PrepareLaunch(original) = directory_request().operation
                     else {

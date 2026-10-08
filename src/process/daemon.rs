@@ -35,10 +35,10 @@ use crate::model::{
     WorkspaceSelection,
 };
 use crate::protocol::{
-    ControlError, ControlOperation, ControlResponse, ControlResult, PROTOCOL_VERSION,
+    APP_VERSION, ControlError, ControlOperation, ControlResponse, ControlResult,
 };
 use crate::transport::{
-    DaemonHello, HandshakeStatus, configure_stream, read_client_hello, read_control_request,
+    HandshakeStatus, configure_stream, read_client_hello, read_control_request,
     write_control_response, write_daemon_hello,
 };
 
@@ -137,7 +137,6 @@ struct DaemonState {
 #[derive(Clone, Debug)]
 struct HerdrRouter {
     default_socket: PathBuf,
-    executable: PathBuf,
     named_sockets: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
@@ -489,18 +488,12 @@ fn handle_connection(mut stream: UnixStream, context: &WorkerContext) -> io::Res
     configure_stream(&stream)?;
     let caller = local_caller(&stream)?;
     let client_version = read_client_hello(&mut stream)?;
-    let status = if client_version.major == PROTOCOL_VERSION.major {
+    let status = if client_version == APP_VERSION {
         HandshakeStatus::Accepted
     } else {
         HandshakeStatus::UnsupportedVersion
     };
-    write_daemon_hello(
-        &mut stream,
-        DaemonHello {
-            version: PROTOCOL_VERSION,
-            status,
-        },
-    )?;
+    write_daemon_hello(&mut stream, APP_VERSION, status)?;
     if status != HandshakeStatus::Accepted {
         return Ok(());
     }
@@ -665,21 +658,15 @@ fn validate_prepare_identity(
     request: &crate::model::PrepareLaunchRequest,
     herdr_router: &HerdrRouter,
 ) -> Result<ValidatedPrepareIdentity, ControlError> {
-    if request.no_multiplex {
-        if request.herdr.is_some()
-            || request.continuation.is_some()
-            || request.continuation_token.is_some()
-        {
-            return Err(permission_denied(
-                "foreground launch cannot carry Herdr inputs",
-            ));
-        }
-        return Ok(ValidatedPrepareIdentity {
-            herdr: None,
-            pane: None,
-        });
+    if request.no_multiplex
+        && (request.continuation.is_some() || request.continuation_token.is_some())
+    {
+        return Err(permission_denied(
+            "current-terminal launch cannot carry Herdr routing inputs",
+        ));
     }
-    if request.workspace.workspace == WorkspaceSelection::Here
+    if !request.no_multiplex
+        && request.workspace.workspace == WorkspaceSelection::Here
         && request.continuation_token.is_none()
     {
         if request.herdr.is_some() {
@@ -693,7 +680,7 @@ fn validate_prepare_identity(
         });
     }
     let Some(context) = request.herdr.as_ref() else {
-        if request.profile == "pi" {
+        if !request.no_multiplex && request.profile == "pi" {
             return Err(permission_denied("Pi launch requires Herdr identity"));
         }
         return Ok(ValidatedPrepareIdentity {
@@ -726,7 +713,7 @@ fn launcher_continuation_command(
     executable: &Path,
     socket: &Path,
     token: &str,
-    here: bool,
+    no_worktree: bool,
 ) -> Result<String, ControlError> {
     if !executable.is_absolute() || !socket.is_absolute() || token.len() != 64 {
         return Err(permission_denied("invalid launcher continuation inputs"));
@@ -744,7 +731,7 @@ fn launcher_continuation_command(
             executable, "launcher", "--socket", socket, "--resume", token,
         ]
         .into_iter()
-        .chain(here.then_some("--here")),
+        .chain(no_worktree.then_some("--no-worktree")),
     ))
 }
 
@@ -868,6 +855,7 @@ fn redirect_launch(
         socket_path: handoff.socket_path,
         profile: std::mem::take(&mut request.profile),
         command: handoff.command,
+        mount_arguments: handoff.mount_arguments,
         workspace: std::mem::replace(&mut request.workspace.workspace, WorkspaceSelection::Here),
     };
     let context = HerdrContext {
@@ -1331,7 +1319,6 @@ impl HerdrRouter {
     fn new(default_socket: PathBuf) -> Self {
         Self {
             default_socket,
-            executable: default_herdr_executable(),
             named_sockets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1356,7 +1343,7 @@ impl HerdrRouter {
         {
             return Ok(socket);
         }
-        let socket = discover_herdr_session_socket(&self.executable, session_name)?;
+        let socket = discover_herdr_session_socket(session_name)?;
         validate_herdr_socket(&socket)?;
         self.named_sockets
             .lock()
@@ -1414,6 +1401,7 @@ fn publish_instance_activity(
     herdr
         .publish_activity(
             &pane.pane_id,
+            &existing.profile,
             activity_state(activity.state),
             activity.message.as_deref(),
             ACTIVITY_SEQUENCE.fetch_add(1, Ordering::Relaxed),
@@ -1429,17 +1417,14 @@ const fn activity_state(state: ActivityState) -> HerdrActivityState {
     }
 }
 
-fn herdr_discovery_error(message: &str) -> ControlError {
+fn herdr_discovery_error(message: impl Into<String>) -> ControlError {
     ControlError {
         code: "herdr_unavailable".to_owned(),
-        message: message.to_owned(),
+        message: message.into(),
     }
 }
 
-fn discover_herdr_session_socket(
-    executable: &Path,
-    session_name: &str,
-) -> Result<PathBuf, ControlError> {
+fn discover_herdr_session_socket(session_name: &str) -> Result<PathBuf, ControlError> {
     if session_name.is_empty()
         || session_name.len() > 128
         || session_name.chars().any(char::is_control)
@@ -1449,25 +1434,23 @@ fn discover_herdr_session_socket(
             message: "Herdr session name is invalid".to_owned(),
         });
     }
-    validate_herdr_executable(executable)?;
-    let mut child = Command::new(executable)
+    let mut child = Command::new("herdr")
         .args(["session", "list", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| herdr_discovery_error("Herdr session discovery could not start"))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| herdr_discovery_error("Herdr session discovery has no output"))?;
-    let reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stdout
-            .take((MAX_HERDR_DISCOVERY_BYTES + 1) as u64)
-            .read_to_end(&mut output)
-            .map(|_| output)
-    });
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| herdr_discovery_error("Herdr session discovery has no error output"))?;
+    let reader = read_discovery_pipe(stdout, (MAX_HERDR_DISCOVERY_BYTES + 1) as u64);
+    let error_reader = read_discovery_pipe(stderr, 4096);
     let deadline = std::time::Instant::now() + HERDR_DISCOVERY_TIMEOUT;
     let status = loop {
         if let Some(status) = child
@@ -1480,6 +1463,7 @@ fn discover_herdr_session_socket(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            let _ = error_reader.join();
             return Err(herdr_discovery_error("Herdr session discovery timed out"));
         }
         thread::sleep(Duration::from_millis(10));
@@ -1488,8 +1472,25 @@ fn discover_herdr_session_socket(
         .join()
         .map_err(|_| herdr_discovery_error("Herdr session discovery reader failed"))?
         .map_err(|_| herdr_discovery_error("Herdr session discovery output failed"))?;
+    let stderr = error_reader
+        .join()
+        .map_err(|_| herdr_discovery_error("Herdr session discovery error reader failed"))?
+        .map_err(|_| herdr_discovery_error("Herdr session discovery error output failed"))?;
     if !status.success() {
-        return Err(herdr_discovery_error("Herdr session discovery failed"));
+        let diagnostic: String = String::from_utf8_lossy(&stderr)
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        return Err(herdr_discovery_error(format!(
+            "Herdr session discovery failed ({status}): {}",
+            diagnostic.trim()
+        )));
     }
     if output.len() > MAX_HERDR_DISCOVERY_BYTES {
         return Err(herdr_discovery_error(
@@ -1499,6 +1500,16 @@ fn discover_herdr_session_socket(
     let listing: HerdrSessionList = serde_json::from_slice(&output)
         .map_err(|_| herdr_discovery_error("Herdr session discovery returned invalid JSON"))?;
     select_herdr_session_socket(listing, session_name)
+}
+
+fn read_discovery_pipe(
+    pipe: impl Read + Send + 'static,
+    limit: u64,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.take(limit).read_to_end(&mut output).map(|_| output)
+    })
 }
 
 fn select_herdr_session_socket(
@@ -1527,21 +1538,6 @@ fn select_herdr_session_socket(
         ));
     }
     Ok(session.socket_path)
-}
-
-fn validate_herdr_executable(path: &Path) -> Result<(), ControlError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| herdr_discovery_error("Herdr executable is unavailable"))?;
-    if !path.is_absolute()
-        || !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != UnixCredentials::new().uid()
-        || metadata.mode() & 0o022 != 0
-        || metadata.mode() & 0o111 == 0
-    {
-        return Err(herdr_discovery_error("Herdr executable is not trusted"));
-    }
-    Ok(())
 }
 
 fn validate_herdr_session_directory(path: &Path) -> Result<(), ControlError> {
@@ -1732,16 +1728,6 @@ fn activity_socket_path(control_socket: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .join("activity/status.sock")
-}
-
-fn default_herdr_executable() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .map_or_else(
-            || PathBuf::from("/herdr-home-unavailable/herdr"),
-            |home| home.join(".local/bin/herdr"),
-        )
 }
 
 fn default_herdr_socket() -> PathBuf {

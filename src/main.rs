@@ -21,7 +21,71 @@ use config::{
 
 use crate::config::FileConfig;
 
-const AFTER_HELP: &str = "Configuration:\n  $XDG_CONFIG_HOME/runroom/config.toml\n  or $HOME/.config/runroom/config.toml\n\nCoordinator keys:\n  runtime = \"bubblewrap\"\n  socket = \"/path/to/control.sock\"\n\nLauncher profiles:\n  [launcher]\n  profile = \"pi\"\n  name = \"default-workspace\"\n  verbose = false\n\n  [launcher.profiles.pi]\n  command = \"pi\"\n  network = \"host\"\n  identity = \"herdr\"\n  memory_max_bytes = 8589934592\n  tasks_max = 512\n  cpu_quota_basis_points = 20000\n  cpu_count = 2\n  # Or select a shared set: cpu_cores = [0, 1, 2, 3, 4, 5, 6, 7]\n  environment = [\"PATH\", \"TERM\"]\n  bind_mounts = [\n    { source = \"@workspace\", destination = \"/workspace\", access = \"rw\" },\n  ]\n\n  [daemon]\n  workspace_root = \"/path/to/durable/workspaces\"\n  state_file = \"/path/to/private/instances.json\"\n  verbose = false\n\n  [daemon.resource_ceiling]\n  memory_max_bytes = 68719476736\n  tasks_max = 4096\n  cpu_quota_basis_points = 100000\n\n--here runs the exact current directory, not the Git project root, and also works\noutside Git. It creates no worktree and ignores the configured default workspace name;\nit conflicts with --name. By default it opens a new tab in the default Herdr session.\n--no-multiplex runs in the current terminal without Herdr routing or identity and can\nbe used with --here or regular workspace launches. Both flags also work after launcher.\nThe configured command, profile and resource limits remain selected; -c overrides only\nthe command. With Bubblewrap, --here exposes the directory read-write at /workspace,\nreplacing other @workspace mappings while retaining explicit profile host mounts as\npermissions. Native mode does not confine files; --here never changes the runtime.\nUpgrade the launcher and daemon together: these modes use control protocol 9.\n\nCPU placement uses either cpu_cores (nonempty unique logical CPU IDs, 0..1023)\nor cpu_count (1..1024), never both. IDs must be available to the runtime leader;\na count selects its lowest available logical CPU IDs. systemd AllowedCPUs hard-restricts\nthe instance and all descendants to that set, unlike cpu_quota_basis_points, which\nlimits CPU time. Placement is shared, not an exclusive reservation: instances can\nuse the same CPUs, including the same eight-core set or lowest two CPUs.\n--cpu-cores 0,1 or --cpu-count 2 replaces both profile CPU selection values.\nCommand-line values override configuration values for the selected mode and profile.\nCommand strings use shell-style quoting to separate words, but are executed directly without a shell.";
+const AFTER_HELP: &str = r#"Configuration:
+  $XDG_CONFIG_HOME/runroom/config.toml
+  or $HOME/.config/runroom/config.toml
+
+Coordinator keys:
+  runtime = "bubblewrap"
+  socket = "/path/to/control.sock"
+
+Launcher profiles:
+  [launcher]
+  profile = "pi"
+  name = "default-workspace"
+  verbose = false
+
+  [launcher.profiles.pi]
+  command = "pi"
+  network = "host"
+  identity = "herdr"
+  memory_max_bytes = 8589934592
+  tasks_max = 512
+  cpu_quota_basis_points = 20000
+  cpu_count = 2
+  # Or select a shared set: cpu_cores = [0, 1, 2, 3, 4, 5, 6, 7]
+  environment = ["PATH", "TERM"]
+  bind_mounts = [
+    { source = "@workspace", destination = "/workspace", access = "rw" },
+  ]
+
+  [daemon]
+  workspace_root = "/path/to/durable/workspaces"
+  state_file = "/path/to/private/instances.json"
+  verbose = false
+
+  [daemon.resource_ceiling]
+  memory_max_bytes = 68719476736
+  tasks_max = 4096
+  cpu_quota_basis_points = 100000
+
+--here executes in this shell/pane without creating or switching Herdr tabs.
+Inside Herdr it retains the current pane identity and activity reporting;
+outside Herdr it runs locally without Herdr reporting.
+--no-worktree uses the exact current directory, not the Git project root, and also
+works outside Git. It creates no worktree, ignores the configured default workspace
+name, and conflicts with --name. Without --here it opens a tab in the default
+Herdr session. Combine --here --no-worktree to use this directory in this shell.
+Both flags also work after launcher. --no-multiplex has been removed.
+The configured command, profile and resource limits remain selected; -c overrides
+only the command. With Bubblewrap, --no-worktree exposes the directory read-write
+at /workspace, replacing @workspace mappings but retaining profile host mounts.
+Native mode does not confine files; neither flag changes the selected runtime.
+Upgrade the launcher and daemon together: their full application versions must match.
+
+--ro/--read-only PATH grants read-only access at /BASENAME; relative sources resolve
+against the invoking host directory. -m/--mount SOURCE@DEST:ro|rw sets an explicit
+destination. Repeat flags for multiple mounts; duplicate destinations are errors.
+
+CPU placement uses either cpu_cores (nonempty unique logical CPU IDs, 0..1023)
+or cpu_count (1..1024), never both. IDs must be available to the runtime leader;
+a count selects its lowest available logical CPU IDs. systemd AllowedCPUs hard-restricts
+the instance and all descendants to that set, unlike cpu_quota_basis_points, which
+limits CPU time. Placement is shared, not an exclusive reservation: instances can
+use the same CPUs, including the same eight-core set or lowest two CPUs.
+--cpu-cores 0,1 or --cpu-count 2 replaces both profile CPU selection values.
+Command-line values override configuration values for the selected mode and profile.
+Command strings use shell-style quoting to separate words, but are executed directly without a shell."#;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,11 +115,11 @@ struct LauncherArgs {
 
     /// Run the exact current directory, including non-Git directories, without a worktree.
     #[arg(long, conflicts_with = "name")]
-    here: bool,
+    no_worktree: bool,
 
-    /// Run in the current terminal without Herdr multiplexing or identity.
+    /// Run in this shell/pane without creating a tab; retain available Herdr reporting.
     #[arg(long)]
-    no_multiplex: bool,
+    here: bool,
 
     /// Launch profile selecting the command and its capabilities.
     #[arg(long, value_name = "PROFILE")]
@@ -82,6 +146,14 @@ struct LauncherArgs {
     #[arg(long, value_name = "COUNT", conflicts_with = "cpu_cores")]
     cpu_count: Option<u32>,
 
+    /// Bind a host path read-only at /BASENAME; repeatable.
+    #[arg(long = "read-only", visible_alias = "ro", value_name = "PATH")]
+    read_only: Vec<PathBuf>,
+
+    /// Add a launch-only bind mount; repeatable.
+    #[arg(short = 'm', long = "mount", value_name = "SOURCE@DEST:ro|rw")]
+    mounts: Vec<String>,
+
     /// Internal one-time Herdr handoff token.
     #[arg(long, value_name = "TOKEN", hide = true)]
     resume: Option<String>,
@@ -95,13 +167,15 @@ impl LauncherArgs {
     const fn is_empty(&self) -> bool {
         self.socket.is_none()
             && self.name.is_none()
+            && !self.no_worktree
             && !self.here
-            && !self.no_multiplex
             && self.profile.is_none()
             && !self.verbose
             && self.command.is_none()
             && self.cpu_cores.is_none()
             && self.cpu_count.is_none()
+            && self.read_only.is_empty()
+            && self.mounts.is_empty()
             && self.resume.is_none()
             && self.continuation_token.is_none()
     }
@@ -109,13 +183,15 @@ impl LauncherArgs {
     const fn has_only_verbose(&self) -> bool {
         self.socket.is_none()
             && self.name.is_none()
+            && !self.no_worktree
             && !self.here
-            && !self.no_multiplex
             && self.profile.is_none()
             && self.command.is_none()
             && self.cpu_cores.is_none()
             && self.cpu_count.is_none()
             && self.resume.is_none()
+            && self.read_only.is_empty()
+            && self.mounts.is_empty()
             && self.continuation_token.is_none()
     }
 }
@@ -584,10 +660,10 @@ fn launcher_mode(
     mut file: config::FileConfig,
 ) -> Result<SelectedMode, Box<dyn Error>> {
     file.override_cpu_selection(args.profile.as_deref(), args.cpu_cores, args.cpu_count)?;
-    file.override_launch_mode(args.profile.as_deref(), args.here, args.no_multiplex)?;
+    file.override_launch_mode(args.profile.as_deref(), args.no_worktree)?;
     let resume = args.resume.clone();
     let continuation_token = args.continuation_token.clone();
-    let settings = LauncherSettings::resolve(
+    let mut settings = LauncherSettings::resolve(
         args.socket,
         args.name,
         args.profile,
@@ -595,16 +671,23 @@ fn launcher_mode(
         args.verbose,
         &file,
     )?;
-    let has_herdr_identity = !args.no_multiplex && settings.identity.is_some();
+    let mount_arguments = config::apply_launch_mounts(
+        &mut settings.runtime,
+        &args.read_only,
+        &args.mounts,
+        &env::current_dir()?,
+    )?;
+    let has_herdr_identity = settings.identity.is_some();
     let mut config = LauncherConfig::new(
         settings.socket,
         settings.profile,
         settings.command,
         settings.runtime,
     )
+    .mount_arguments(mount_arguments)
     .resource_limits(settings.limits)
+    .no_worktree(args.no_worktree)
     .here(args.here)
-    .no_multiplex(args.no_multiplex)
     .herdr_identity(has_herdr_identity);
     config =
         config.project_environment(settings.project_environment, settings.environment_allowlist);
@@ -789,18 +872,18 @@ mod tests {
     fn accepts_directory_and_foreground_launches_but_rejects_named_directory_launches() {
         for prefix in [vec!["runroom"], vec!["runroom", "launcher"]] {
             for flags in [
+                vec!["--no-worktree"],
                 vec!["--here"],
-                vec!["--no-multiplex"],
-                vec!["--here", "--no-multiplex"],
-                vec!["--name", "review", "--no-multiplex"],
+                vec!["--no-worktree", "--here"],
+                vec!["--name", "review", "--here"],
             ] {
                 let mut arguments = prefix.clone();
                 arguments.extend(flags);
                 Cli::try_parse_from(arguments).expect("accept launch selection");
             }
             for flags in [
-                ["--here", "--name", "review"],
-                ["--name", "review", "--here"],
+                ["--no-worktree", "--name", "review"],
+                ["--name", "review", "--no-worktree"],
             ] {
                 let mut arguments = prefix.clone();
                 arguments.extend(flags);
@@ -816,7 +899,7 @@ mod tests {
 
     #[test]
     fn rejects_launch_switches_in_other_modes_but_preserves_root_pi_arguments() {
-        for flag in ["--here", "--no-multiplex"] {
+        for flag in ["--here", "--no-worktree"] {
             for arguments in [
                 vec!["daemon"],
                 vec!["verify", "--config", "/tmp/config.toml"],

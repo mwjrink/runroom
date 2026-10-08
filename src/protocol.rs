@@ -10,18 +10,8 @@ use crate::model::{
     WorkspaceName,
 };
 
-/// Protocol version with nonredundant launcher handoff inputs.
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
-    major: 10,
-    minor: 0,
-};
-
-/// Protocol compatibility version exchanged during the connection handshake.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProtocolVersion {
-    pub major: u16,
-    pub minor: u16,
-}
+/// Application version shared by the CLI and the exact-match connection handshake.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Request envelope accepted after a successful handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
