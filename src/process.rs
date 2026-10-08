@@ -151,6 +151,7 @@ mod tests {
                 crate::model::RuntimePolicy {
                     kind: crate::model::RuntimeKind::Native,
                     network: crate::model::NetworkMode::Host,
+                    port_forwards: Vec::new(),
                     bind_mounts: Vec::new(),
                     devices: Vec::new(),
                     environment: Vec::new(),

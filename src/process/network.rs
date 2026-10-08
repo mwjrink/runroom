@@ -6,7 +6,9 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -18,16 +20,18 @@ use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{Signal, kill, killpg};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 use nix::unistd::{Pid, pipe2, write};
 use serde::Deserialize;
 use signal_hook::SigId;
 
-use crate::model::{ForegroundCommand, PreparedExec};
+use crate::model::{ForegroundCommand, PortForward, PreparedExec};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INFO_BYTES: usize = 4096;
+const MAX_API_BYTES: usize = 4096;
 
 /// Run an already prepared, isolated bubblewrap command with private networking.
 ///
@@ -37,6 +41,7 @@ const MAX_INFO_BYTES: usize = 4096;
 pub(super) fn run(
     prepared: &PreparedExec,
     foreground: &ForegroundCommand,
+    forwards: &[PortForward],
 ) -> io::Result<ExitStatus> {
     // Register before spawning, and retain handlers until all child guards drop.
     let signals = LauncherSignals::new()?;
@@ -75,6 +80,7 @@ pub(super) fn run(
         gate: Some(gate_write),
         helper_exit: None,
         confirmation,
+        api_directory: None,
     };
     // The parent never retains the child's ends, and slirp cannot inherit them.
     drop(info_write);
@@ -86,9 +92,10 @@ pub(super) fn run(
 
     let pid = read_child_pid(&mut info_read, &mut supervisor, &signals, deadline)?;
     drop(info_read);
-    let mut ready = supervisor.start_helper(pid)?;
+    let mut ready = supervisor.start_helper(pid, !forwards.is_empty())?;
     wait_for_ready(&mut ready, &mut supervisor, &signals, deadline)?;
     drop(ready);
+    supervisor.publish_ports(forwards, &signals, deadline)?;
 
     // Any additional launcher setup belongs before this release. Bubblewrap's
     // block-fd is a generic startup barrier, not a helper-owned network gate.
@@ -138,14 +145,24 @@ struct Supervisor {
     // EOF on this parent-only writer stops slirp, including if the launcher dies.
     helper_exit: Option<OwnedFd>,
     confirmation: tempfile::NamedTempFile,
+    // Removed only after the helper has exited, including on setup failure.
+    api_directory: Option<tempfile::TempDir>,
 }
 
 impl Supervisor {
-    fn start_helper(&mut self, pid: Pid) -> io::Result<File> {
+    fn start_helper(&mut self, pid: Pid, publish: bool) -> io::Result<File> {
         let (ready_read, ready_write) = pipe2(OFlag::O_CLOEXEC)?;
         let (exit_read, exit_write) = pipe2(OFlag::O_CLOEXEC)?;
         let ready_read = File::from(ready_read);
         set_nonblocking(&ready_read)?;
+        if publish {
+            // Force a short, private (0700) pathname, independent of TMPDIR.
+            self.api_directory = Some(
+                tempfile::Builder::new()
+                    .prefix("runroom-slirp-")
+                    .tempdir_in("/tmp")?,
+            );
+        }
 
         let mut command = Command::new("slirp4netns");
         command
@@ -153,7 +170,13 @@ impl Supervisor {
             .arg("--ready-fd")
             .arg(ready_write.as_raw_fd().to_string())
             .arg("--exit-fd")
-            .arg(exit_read.as_raw_fd().to_string())
+            .arg(exit_read.as_raw_fd().to_string());
+        if let Some(directory) = &self.api_directory {
+            command
+                .arg("--api-socket")
+                .arg(directory.path().join("api.sock"));
+        }
+        command
             .arg(pid.as_raw().to_string())
             .arg("tap0")
             .process_group(0)
@@ -174,6 +197,67 @@ impl Supervisor {
         drop(ready_write);
         drop(exit_read);
         Ok(ready_read)
+    }
+
+    fn publish_ports(
+        &mut self,
+        forwards: &[PortForward],
+        signals: &LauncherSignals,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if forwards.is_empty() {
+            return Ok(());
+        }
+        let path = self
+            .api_directory
+            .as_ref()
+            .expect("publishing requests an API socket")
+            .path()
+            .join("api.sock");
+        let address = UnixAddr::new(&path)?;
+        for forward in forwards {
+            let result = (|| {
+                self.check_startup(signals, deadline, "while publishing TCP ports")?;
+                let descriptor = socket(
+                    AddressFamily::Unix,
+                    SockType::Stream,
+                    SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
+                    None,
+                )?;
+                let stream = UnixStream::from(descriptor);
+                match connect(stream.as_raw_fd(), &address) {
+                    Ok(()) => {}
+                    Err(Errno::EINPROGRESS) => loop {
+                        self.check_startup(
+                            signals,
+                            deadline,
+                            "while connecting to slirp4netns API",
+                        )?;
+                        poll_descriptor(&stream, PollFlags::POLLOUT, deadline)?;
+                        if let Some(error) = stream.take_error()? {
+                            return Err(error);
+                        }
+                        if stream.peer_addr().is_ok() {
+                            break;
+                        }
+                    },
+                    Err(error) => return Err(io::Error::from(error)),
+                }
+                register_forward(stream, *forward, deadline, || {
+                    self.check_startup(signals, deadline, "while publishing TCP ports")
+                })
+            })();
+            result.map_err(|error: io::Error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot publish TCP localhost {} to room port {}: {error}",
+                        forward.host_port, forward.room_port
+                    ),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn check_startup(
@@ -291,6 +375,7 @@ impl Drop for Supervisor {
         if let Some(helper) = self.helper.as_mut() {
             let _ = helper.terminate();
         }
+        self.api_directory.take();
     }
 }
 
@@ -405,7 +490,11 @@ fn set_nonblocking(descriptor: &File) -> io::Result<()> {
 }
 
 fn poll_setup(descriptor: &File, deadline: Instant) -> io::Result<()> {
-    let mut descriptors = [PollFd::new(descriptor.as_fd(), PollFlags::POLLIN)];
+    poll_descriptor(descriptor, PollFlags::POLLIN, deadline)
+}
+
+fn poll_descriptor(descriptor: &impl AsFd, events: PollFlags, deadline: Instant) -> io::Result<()> {
+    let mut descriptors = [PollFd::new(descriptor.as_fd(), events)];
     let remaining = deadline.saturating_duration_since(Instant::now());
     let timeout = PollTimeout::try_from(remaining.min(POLL_INTERVAL)).map_err(io::Error::other)?;
     match poll(&mut descriptors, timeout) {
@@ -414,7 +503,7 @@ fn poll_setup(descriptor: &File, deadline: Instant) -> io::Result<()> {
                 .revents()
                 .is_some_and(|events| events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL))
             {
-                return Err(io::Error::other("private-network setup pipe failed"));
+                return Err(io::Error::other("private-network setup descriptor failed"));
             }
             Ok(())
         }
@@ -513,9 +602,254 @@ fn wait_for_ready(
     }
 }
 
+fn register_forward(
+    mut stream: UnixStream,
+    forward: PortForward,
+    deadline: Instant,
+    mut check_startup: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request_bytes = [0_u8; 256];
+    let mut request = io::Cursor::new(request_bytes.as_mut_slice());
+    write!(
+        request,
+        "{{\"execute\":\"add_hostfwd\",\"arguments\":{{\"proto\":\"tcp\",\"host_addr\":\"127.0.0.1\",\"host_port\":{},\"guest_addr\":\"10.0.2.100\",\"guest_port\":{}}}}}",
+        forward.host_port, forward.room_port,
+    )?;
+    let length = usize::try_from(request.position()).map_err(io::Error::other)?;
+    let mut pending = &request_bytes[..length];
+    while !pending.is_empty() {
+        check_startup()?;
+        match stream.write(pending) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "slirp4netns API closed during request",
+                ));
+            }
+            Ok(count) => pending = &pending[count..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_descriptor(&stream, PollFlags::POLLOUT, deadline)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    // The documented API requires SHUT_WR after each request, without keep-alive.
+    // https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md#api-socket
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = [0_u8; MAX_API_BYTES + 1];
+    let mut used = 0;
+    loop {
+        check_startup()?;
+        match stream.read(&mut response[used..]) {
+            Ok(0) => return parse_forward_response(&response[..used]),
+            Ok(count) => {
+                used += count;
+                if used > MAX_API_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "slirp4netns API response exceeds the 4096-byte limit",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                poll_descriptor(&stream, PollFlags::POLLIN, deadline)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn parse_forward_response(bytes: &[u8]) -> io::Result<()> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Response {
+        #[serde(rename = "return")]
+        result: Option<ForwardId>,
+        error: Option<ApiError>,
+    }
+    #[derive(Deserialize)]
+    struct ForwardId {
+        id: u32,
+    }
+    #[derive(Deserialize)]
+    struct ApiError {
+        desc: String,
+    }
+    let response: Response = serde_json::from_slice(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid slirp4netns add_hostfwd response: {error}"),
+        )
+    })?;
+    if let Some(error) = response.error {
+        return Err(io::Error::other(format!(
+            "slirp4netns rejected add_hostfwd: {}; the host port may already be occupied",
+            error.desc,
+        )));
+    }
+    if response.result.is_none_or(|result| result.id == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "slirp4netns add_hostfwd response lacks a valid forwarding id",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_child_pid;
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    const FORWARD: PortForward = PortForward {
+        host_port: 23001,
+        room_port: 3000,
+    };
+
+    fn exchange_response(response: Vec<u8>) -> io::Result<()> {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.set_read_timeout(Some(SETUP_TIMEOUT)).unwrap();
+        let responder = thread::spawn(move || {
+            let mut request = Vec::new();
+            // Reading to EOF exercises the mandatory client SHUT_WR.
+            server.read_to_end(&mut request).unwrap();
+            // An oversized reply can make the client close before all writes.
+            let _ = server.write_all(&response);
+        });
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        let result = register_forward(client, FORWARD, deadline, || {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "test API deadline"));
+            }
+            Ok(())
+        });
+        responder.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn forward_api_requires_write_shutdown_and_valid_registration() {
+        exchange_response(br#"{"return":{"id":42}}"#.to_vec()).unwrap();
+    }
+
+    #[test]
+    fn forward_api_rejects_errors_and_malformed_responses() {
+        for response in [
+            &b""[..],
+            &b"not JSON"[..],
+            &b"{}"[..],
+            &br#"{"return":{}}"#[..],
+            &br#"{"return":{"id":0}}"#[..],
+            &br#"{"return":{"id":-1}}"#[..],
+            &br#"{"return":{"id":"42"}}"#[..],
+            &br#"{"return":{"id":42,"id":43}}"#[..],
+            &br#"{"return":{"id":42}} trailing"#[..],
+            &br#"{"error":{"desc":"slirp_add_hostfwd failed"}}"#[..],
+            &br#"{"return":{"id":42},"error":{"desc":"failure"}}"#[..],
+        ] {
+            assert!(
+                exchange_response(response.to_vec()).is_err(),
+                "accepted {response:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_api_enforces_response_size_boundary() {
+        let mut response = br#"{"return":{"id":42}}"#.to_vec();
+        response.resize(MAX_API_BYTES, b' ');
+        exchange_response(response.clone()).unwrap();
+        response.push(b' ');
+        assert_eq!(
+            exchange_response(response).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn forward_api_stall_obeys_startup_deadline() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = register_forward(client, FORWARD, deadline, || {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "API deadline"));
+            }
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // The client drops its socket on failure instead of leaving a session.
+        let mut request = String::new();
+        server.read_to_string(&mut request).unwrap();
+        assert!(request.contains("add_hostfwd"));
+    }
+
+    #[test]
+    fn failed_registration_keeps_gate_closed_and_cleans_helper_socket() {
+        let signals = LauncherSignals::new().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("runroom-api-test-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().to_owned();
+        let listener = UnixListener::bind(path.join("api.sock")).unwrap();
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            stream
+                .write_all(br#"{"error":{"desc":"occupied host port"}}"#)
+                .unwrap();
+        });
+        let sandbox = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let helper = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let (gate_read, gate_write) = pipe2(OFlag::O_CLOEXEC | OFlag::O_NONBLOCK).unwrap();
+        let mut gate_read = File::from(gate_read);
+        let mut supervisor = Supervisor {
+            sandbox: ManagedChild::new(sandbox, false),
+            helper: Some(ManagedChild::new(helper, true)),
+            gate: Some(gate_write),
+            helper_exit: None,
+            confirmation: tempfile::NamedTempFile::new().unwrap(),
+            api_directory: Some(directory),
+        };
+        let result = supervisor.publish_ports(&[FORWARD], &signals, Instant::now() + SETUP_TIMEOUT);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(
+            supervisor.confirmation.as_file().metadata().unwrap().len(),
+            0
+        );
+        assert_eq!(
+            gate_read.read(&mut [0_u8; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+        );
+        let sandbox_pid = supervisor.sandbox.pid();
+        let helper_pid = supervisor.helper.as_ref().unwrap().pid();
+        drop(supervisor);
+        responder.join().unwrap();
+        assert!(!path.exists());
+        assert_eq!(kill(sandbox_pid, None), Err(Errno::ESRCH));
+        assert_eq!(kill(helper_pid, None), Err(Errno::ESRCH));
+        let deadline = Instant::now() + SETUP_TIMEOUT;
+        loop {
+            match gate_read.read(&mut [0_u8; 1]) {
+                Ok(0) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    // Concurrent test spawns can briefly retain a forked CLOEXEC writer.
+                    assert!(Instant::now() < deadline, "startup gate writer leaked");
+                    poll_setup(&gate_read, deadline).unwrap();
+                }
+                result => panic!("failed setup unexpectedly released its gate: {result:?}"),
+            }
+        }
+    }
 
     #[test]
     fn child_info_allows_namespace_metadata() {

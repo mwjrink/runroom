@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use runroom::model::{
-    InstanceId, InstanceRecord, InstanceState, ServiceAction, ServiceConfiguration, ServiceResult,
-    StopMode,
+    InstanceId, InstanceRecord, InstanceState, PortForward, ServiceAction, ServiceConfiguration,
+    ServiceResult, StopMode,
 };
 use runroom::{DaemonConfig, HostClient, LauncherConfig, RunMode, run_atomic_worker, start};
 use tracing::debug;
@@ -79,6 +79,10 @@ struct LauncherArgs {
     #[arg(long, hide = true, value_name = "LABEL")]
     herdr_agent: Option<String>,
 
+    /// Frozen invoking directory basename carried by symbolic workspace replay.
+    #[arg(long, hide = true, value_name = "NAME", allow_hyphen_values = true)]
+    workspace_directory: Option<String>,
+
     /// Show detailed launcher lifecycle logs.
     #[arg(short, long, action = ArgAction::SetTrue)]
     verbose: bool,
@@ -90,6 +94,10 @@ struct LauncherArgs {
     /// Network policy for this launch, overriding the selected profile.
     #[arg(long, value_enum, value_name = "host|none|private")]
     network: Option<config::NetworkFileMode>,
+
+    /// Publish a private room TCP port on host localhost (repeatable).
+    #[arg(long, value_name = "HOST_PORT:ROOM_PORT", value_parser = config::parse_port_forward)]
+    publish: Vec<PortForward>,
 
     /// Logical CPU IDs allowed for the instance and all descendants, not a CPU-time quota.
     #[arg(
@@ -142,10 +150,12 @@ impl LauncherArgs {
             && !self.here
             && self.profile.is_none()
             && self.herdr_agent.is_none()
+            && self.workspace_directory.is_none()
             && !self.verbose
             && self.command.is_none()
             && self.cpu_cores.is_none()
             && self.network.is_none()
+            && self.publish.is_empty()
             && self.cpu_count.is_none()
             && self.read_only.is_empty()
             && self.mounts.is_empty()
@@ -164,9 +174,11 @@ impl LauncherArgs {
             && !self.here
             && self.profile.is_none()
             && self.herdr_agent.is_none()
+            && self.workspace_directory.is_none()
             && self.command.is_none()
             && self.cpu_cores.is_none()
             && self.network.is_none()
+            && self.publish.is_empty()
             && self.cpu_count.is_none()
             && self.resume.is_none()
             && self.restore_args.is_none()
@@ -389,7 +401,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let current_directory = env::current_dir()?;
             let profiles = profiles
                 .into_iter()
-                .map(|profile| profile.resolve(&current_directory))
+                .map(|profile| profile.resolve(&current_directory, None))
                 .collect::<Result<Vec<_>, _>>()?;
             if !args.offline {
                 let socket = profiles
@@ -785,6 +797,15 @@ fn canonical_replay_arguments(
         "--config-hash".to_owned(),
         config_hash.to_owned(),
     ];
+    if let Some(directory) = &settings.workspace_directory {
+        arguments.extend(["--workspace-directory".to_owned(), directory.clone()]);
+    }
+    for forward in &settings.runtime.port_forwards {
+        arguments.extend([
+            "--publish".to_owned(),
+            format!("{}:{}", forward.host_port, forward.room_port),
+        ]);
+    }
     if let Some(cores) = &settings.limits.cpu_cores {
         arguments.extend([
             "--cpu-cores".to_owned(),
@@ -838,6 +859,7 @@ fn launcher_mode(
     };
     file.override_cpu_selection(args.profile.as_deref(), args.cpu_cores, args.cpu_count)?;
     file.override_network(args.profile.as_deref(), args.network)?;
+    file.override_port_forwards(args.profile.as_deref(), args.publish)?;
     file.override_launch_mode(args.profile.as_deref(), args.no_worktree)?;
     let effective = EffectiveLauncherConfig::merge(
         socket,
@@ -864,7 +886,7 @@ fn launcher_mode(
 
     // Declarative launcher intent is complete; host-dependent resolution starts here.
     let current_directory = env::current_dir()?;
-    let settings = effective.resolve(&current_directory)?;
+    let settings = effective.resolve(&current_directory, args.workspace_directory.as_deref())?;
     let replay_arguments = canonical_replay_arguments(&settings, &config_hash)?;
     let has_herdr_identity = settings.identity.is_some();
     let mut config = LauncherConfig::new(
@@ -935,6 +957,84 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn publish_parser_is_bounded_and_repeatable() {
+        let parsed =
+            Cli::try_parse_from(["runroom", "--publish", "23001:3000", "--publish", "65535:1"])
+                .unwrap();
+        assert_eq!(
+            parsed.launcher.publish,
+            vec![
+                PortForward {
+                    host_port: 23001,
+                    room_port: 3000
+                },
+                PortForward {
+                    host_port: 65535,
+                    room_port: 1
+                },
+            ]
+        );
+        assert!(!parsed.launcher.is_empty());
+        assert!(!parsed.launcher.has_only_verbose());
+        for value in [
+            "0:1", "1:0", "65536:1", "1:65536", "+1:2", "1:2:3", ":1", "1:", " 1:2", "1",
+            "000001:2",
+        ] {
+            assert!(
+                Cli::try_parse_from(["runroom", "--publish", value]).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn published_ports_replay_overrides_matching_ports_and_keeps_new_ports() {
+        let file: FileConfig =
+            toml::from_str("socket='/control.sock'\n[launcher.profiles.default]\ncommand='pi'")
+                .unwrap();
+        let mut settings =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
+                .unwrap()
+                .resolve(Path::new("/"), None)
+                .unwrap();
+        settings.runtime.network = runroom::model::NetworkMode::Private;
+        settings.runtime.port_forwards = vec![PortForward {
+            host_port: 23001,
+            room_port: 3000,
+        }];
+        let replay = canonical_replay_arguments(&settings, CONFIG_HASH).unwrap();
+        let parsed = Cli::try_parse_from(
+            std::iter::once("runroom").chain(replay.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert_eq!(parsed.launcher.publish, settings.runtime.port_forwards);
+        let mut current: FileConfig = toml::from_str(
+            "runtime='bubblewrap'\n[launcher.profiles.default]\ncommand='pi'\nnetwork='private'\n\
+             bind_mounts=[{source='@workspace',destination='/workspace',access='rw'}]\n\
+             port_forwards=[{host_port=24001,room_port=3000},{host_port=24002,room_port=4000}]",
+        )
+        .unwrap();
+        current
+            .override_port_forwards(None, parsed.launcher.publish)
+            .unwrap();
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &current).unwrap();
+        assert_eq!(
+            effective.runtime.port_forwards,
+            vec![
+                PortForward {
+                    host_port: 23001,
+                    room_port: 3000
+                },
+                PortForward {
+                    host_port: 24002,
+                    room_port: 4000
+                },
+            ]
+        );
+    }
+
     const CONFIG_HASH: &str = "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
@@ -947,7 +1047,11 @@ mod tests {
         .unwrap();
         assert!(restored.launcher.restored);
         assert!(restored.launcher.config_hash.is_none());
-        for (flag, value) in [("--herdr-agent", "frozen"), ("--config-hash", CONFIG_HASH)] {
+        for (flag, value) in [
+            ("--herdr-agent", "frozen"),
+            ("--config-hash", CONFIG_HASH),
+            ("--workspace-directory", "original"),
+        ] {
             let cli =
                 Cli::try_parse_from(["runroom", "--restore-args", &payload, flag, value]).unwrap();
             assert!(resolve_restore_cli(cli).is_err());
@@ -1005,7 +1109,7 @@ cpu_cores = [0, 1]
             &file,
         )
         .unwrap()
-        .resolve(Path::new("/"))
+        .resolve(Path::new("/"), None)
         .unwrap();
         settings.mount_arguments = vec!["/host/grant@/grant:ro".to_owned()];
         let replay = canonical_replay_arguments(&settings, CONFIG_HASH).unwrap();
@@ -1074,6 +1178,114 @@ cpu_cores = [0, 1]
     }
 
     #[test]
+    fn symbolic_workspace_replay_restores_captured_directory_from_generated_worktree() {
+        let mut file: FileConfig = toml::from_str(
+            "socket='/control.sock'\n[launcher.profiles.default]\ncommand='pi'\n\
+             bind_mounts=[{source='@workspace',destination='/@workspace',access='rw'}]",
+        )
+        .unwrap();
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        let config_hash = effective.fingerprint().unwrap();
+        let settings = effective.resolve(Path::new("/project/-src"), None).unwrap();
+        assert_eq!(settings.workspace_directory.as_deref(), Some("-src"));
+        let replay = canonical_replay_arguments(&settings, &config_hash).unwrap();
+        let payload = restore_payload(&replay.iter().map(String::as_str).collect::<Vec<_>>());
+        let restored = resolve_restore_cli(
+            Cli::try_parse_from(["runroom", "--restore-args", &payload]).unwrap(),
+        )
+        .unwrap();
+        let args = restored.launcher;
+        assert!(args.restored && args.here && args.no_worktree);
+        assert_eq!(args.workspace_directory.as_deref(), Some("-src"));
+        assert_eq!(args.config_hash.as_deref(), Some(config_hash.as_str()));
+        file.override_cpu_selection(args.profile.as_deref(), args.cpu_cores, args.cpu_count)
+            .unwrap();
+        file.override_network(args.profile.as_deref(), args.network)
+            .unwrap();
+        file.override_port_forwards(args.profile.as_deref(), args.publish)
+            .unwrap();
+        file.override_launch_mode(args.profile.as_deref(), args.no_worktree)
+            .unwrap();
+        let replay_effective = EffectiveLauncherConfig::merge(
+            args.socket,
+            args.name,
+            args.profile,
+            args.command,
+            args.herdr_agent,
+            args.verbose,
+            &file,
+        )
+        .unwrap()
+        .with_launch_mounts(args.read_only, args.mounts)
+        .unwrap();
+        assert_eq!(replay_effective.fingerprint().unwrap(), config_hash);
+        let replay_settings = replay_effective
+            .resolve(
+                Path::new("/managed/project/generated-worktree"),
+                args.workspace_directory.as_deref(),
+            )
+            .unwrap();
+        assert_eq!(
+            replay_settings.workspace_directory,
+            settings.workspace_directory
+        );
+        assert_eq!(
+            replay_settings.runtime.bind_mounts,
+            settings.runtime.bind_mounts
+        );
+        assert_eq!(
+            replay_settings.runtime.bind_mounts[0].destination,
+            Path::new("/-src")
+        );
+        assert_eq!(
+            canonical_replay_arguments(&replay_settings, &config_hash).unwrap(),
+            replay
+        );
+    }
+
+    #[test]
+    fn explicit_workspace_destination_ignores_unused_directory_context() {
+        let file: FileConfig = toml::from_str(
+            "socket='/control.sock'\n[launcher.profiles.default]\ncommand='pi'\n\
+             bind_mounts=[{source='@workspace',destination='/custom/project',access='rw'}]",
+        )
+        .unwrap();
+        let effective =
+            EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file).unwrap();
+        let config_hash = effective.fingerprint().unwrap();
+        let settings = effective.resolve(Path::new("/"), Some("unused")).unwrap();
+        assert!(settings.workspace_directory.is_none());
+        assert_eq!(
+            settings.runtime.bind_mounts[0].destination,
+            Path::new("/custom/project")
+        );
+        let replay = canonical_replay_arguments(&settings, &config_hash).unwrap();
+        let parsed = Cli::try_parse_from(
+            std::iter::once("runroom").chain(replay.iter().map(String::as_str)),
+        )
+        .unwrap();
+        assert!(parsed.launcher.workspace_directory.is_none());
+    }
+
+    #[test]
+    fn captured_workspace_directory_is_hidden_launcher_only_metadata() {
+        for prefix in [vec!["runroom"], vec!["runroom", "launcher"]] {
+            let mut arguments = prefix;
+            arguments.extend(["--workspace-directory", "-captured"]);
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let args = match cli.role {
+                None => cli.launcher,
+                Some(Role::Launcher(args)) => args,
+                _ => panic!("expected launcher mode"),
+            };
+            assert_eq!(args.workspace_directory.as_deref(), Some("-captured"));
+            assert!(!args.is_empty());
+            assert!(!args.has_only_verbose());
+        }
+    }
+
+    #[test]
     fn default_agent_label_replay_retains_differently_named_profile() {
         let file: FileConfig = toml::from_str(
             "socket = '/control.sock'\n[launcher]\nprofile = 'coding'\n\
@@ -1082,7 +1294,7 @@ cpu_cores = [0, 1]
         .unwrap();
         let settings = EffectiveLauncherConfig::merge(None, None, None, None, None, false, &file)
             .unwrap()
-            .resolve(Path::new("/"))
+            .resolve(Path::new("/"), None)
             .unwrap();
         let replay = canonical_replay_arguments(&settings, CONFIG_HASH).unwrap();
         let parsed = Cli::try_parse_from(
@@ -1392,8 +1604,12 @@ cpu_cores = [0, 1]
     }
 
     #[test]
-    fn rejects_cpu_selection_outside_launcher_mode() {
-        for (flag, value) in [("--cpu-cores", "4,7"), ("--cpu-count", "2")] {
+    fn rejects_value_options_outside_launcher_mode() {
+        for (flag, value) in [
+            ("--cpu-cores", "4,7"),
+            ("--cpu-count", "2"),
+            ("--workspace-directory", "captured"),
+        ] {
             for mode in [
                 "daemon",
                 "verify",

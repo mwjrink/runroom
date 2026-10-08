@@ -40,8 +40,9 @@ Profile entries override the base:
 
 - Omitted scalars inherit; explicit values replace, including `false`.
 - `environment` combines variable names across layers. `set_environment` merges by variable name, with the profile's value winning. Literal assignments take precedence over host passthrough of the same variable.
-- `bind_mounts` merges by normalized destination; a profile mount replaces the base mount at the same destination, including its source, access mode, and `required` flag. Omitted path destinations use the expanded source path; executable mounts without a destination merge by executable name.
+- `bind_mounts` merges by normalized destination; a profile mount replaces the base mount at the same destination, including its source, access mode, and `required` flag. Omitted path destinations use the expanded source path; executable mounts without a destination merge by executable name. A profile `@workspace` binding replaces the inherited workspace binding even when its destination differs; each layer may declare only one workspace binding.
 - `devices` merges by device path or class.
+- `port_forwards` merges by room port: the profile replaces the base mapping for that room port. An explicit `[]` clears inherited mappings.
 - Explicit `[]` or `{}` clears that inherited collection. Omitting a collection retains it.
 - Specifying `cpu_cores` or `cpu_count` replaces the inherited CPU selection. Supplying both remains invalid; CLI CPU flags replace the effective selection.
 
@@ -60,7 +61,7 @@ Mounting `~/.cargo/bin` exposes those files, not their external dependencies. Ru
 Launcher policy and host-derived values are separate:
 
 1. `EffectiveLauncherConfig::merge` combines the selected profile/base settings and CLI overrides. `with_launch_mounts` adds parsed CLI grant declarations. This stage validates configuration syntax and policy without reading host environment values, looking up executables, checking source files, or discovering devices. Environment names, literal assignments, symbolic `~`/`@workspace` paths, optional mounts, and device selectors remain declarations.
-2. `EffectiveLauncherConfig::resolve` consumes that policy and produces `ResolvedLauncherConfig`: current host environment values, expanded/canonical mount sources, executable locations, concrete device grants, an absolute control socket, and canonical CLI mount arguments for replay.
+2. `EffectiveLauncherConfig::resolve` consumes that policy and produces `ResolvedLauncherConfig`: current host environment values, expanded/canonical mount sources, executable locations, concrete device grants, an absolute control socket, and canonical CLI mount arguments for replay. A symbolic workspace destination captures the invoking directory's basename here, before contacting the daemon or selecting/creating a worktree.
 
 The boundary is explicit in `src/main.rs::launcher_mode`, before `effective.resolve(...)`. Neither stage contacts the daemon or creates a workspace/scope. Workspace selection/support mounts and project-environment application remain in the existing later launch phases.
 
@@ -74,7 +75,7 @@ New launches record a versioned SHA-256 fingerprint of the effective policy in t
 
 If the policy changed, Runroom warns and prints an editable normal `runroom --profile … --command '…' --here --no-worktree` command before offering **Resume anyway** or **Cancel**. Only `y` or `yes` proceeds; Enter, EOF, and other answers cancel. With non-interactive stdin or stderr, Runroom exits unsuccessfully after printing the command instead of waiting. Old replay arguments without a fingerprint also require confirmation. Runroom treats the entire harness command as opaque: it never interprets or removes harness resume selectors.
 
-The hash covers runtime/network policy, mount and device declarations, mirrored environment names, literal assignments, project-environment/identity policy, resource limits, and the agent label. It excludes host-derived values, the harness command/session reference, routing flags, socket, workspace name, verbosity, and launch-only mount grants already frozen into replay arguments. CLI overrides are applied before hashing, so replayed overrides still take precedence over changed file defaults.
+The hash covers runtime/network policy, effective port-forward mappings, mount and device declarations, mirrored environment names, literal assignments, project-environment/identity policy, resource limits, and the agent label. It excludes host-derived values (including the captured workspace directory name), the harness command/session reference, routing flags, socket, workspace name, verbosity, and launch-only mount grants already frozen into replay arguments. CLI overrides are applied before hashing, so replayed overrides still take precedence over changed file defaults.
 
 This detects policy changes, not changes to executables, mounted contents, discovered devices, or mirrored environment values. Accepting a mismatch uses the current configuration and records its fingerprint for subsequent restores; it does not restore a configuration snapshot.
 
@@ -102,6 +103,24 @@ Read-only denies writes through that mount, not through another writable alias o
 
 `runroom --no-worktree` uses the exact invoking directory instead of selecting a Git workspace and also works outside Git. By itself it opens a tab in the default Herdr session. Combine `--here --no-worktree` to use the current directory in the current shell. `--no-multiplex` has been removed.
 
+### Workspace mount destinations
+
+Use the exact destination `/@workspace` to name the container mount after the invoking directory:
+
+```toml
+bind_mounts = [
+  { source = "@workspace", destination = "/@workspace", access = "rw" },
+]
+```
+
+Launching from `/home/max/code/brain2` mounts the selected checkout at `/brain2`, even if the daemon creates a worktree named `feature--<hash>`. Launching from `brain2/src` produces `/src`: naming uses the current directory, not Git repository or branch discovery. The harness cwd and Herdr launch descriptor use the same resolved destination.
+
+The captured basename survives Herdr routing and cold resume, so restarting from a generated worktree does not rename the container mount. It is resolution context, separate from the declarative fingerprint; the editable recovery command retains it too. Only the exact `/@workspace` destination on an `@workspace` source is symbolic, not arbitrary string interpolation.
+
+Explicit destinations such as `/runroom` or `/projectname` work with Herdr identity and remain unchanged under `--no-worktree`. As before, `--no-worktree` uses a writable workspace mount. It supplies `/workspace` only when no workspace binding is declared; declared workspace bindings must specify a destination. Existing `/workspace` defaults are unchanged.
+
+Invalid or non-UTF-8 basenames, launching from `/` without a frozen name, protected expanded destinations, and collisions with configured or CLI mounts fail clearly before a daemon launch request. A profile workspace binding replaces the base workspace binding by source identity rather than creating a second workspace mount.
+
 ## Networking
 
 Select networking in a launcher profile:
@@ -121,9 +140,34 @@ network = "private"
 
 `private` requires Bubblewrap, `slirp4netns` on the launcher's host `PATH`, and a usable `/dev/net/tun`. Each launch gets a separate network namespace with `lo` and `tap0`. No host bridge, interface, forwarding sysctl, or firewall rules are created. This is visibility isolation, not a host/LAN access restriction: host-loopback services are reachable through the virtual gateway `10.0.2.2`, while sandbox `127.0.0.1` remains sandbox-local. Forwarding follows the helper's host routing/firewall/VPN policy; application-specific VPN exclusions still matter. IPv6 forwarding is not enabled.
 
-The launcher owns Bubblewrap's startup gate. It starts slirp, waits for readiness, then authorizes and releases the harness; additional pre-start setup belongs before that release. A read-only launch confirmation prevents Bubblewrap's EOF-unblock behavior from executing the harness on setup failure. Setup is bounded to ten seconds, and missing/failed helpers never fall back to host networking. The launcher supervises both processes, preserves harness stdin and exit status, and stops the sandbox if its network helper exits.
+The launcher owns Bubblewrap's startup gate. It starts slirp, waits for readiness, registers any published ports, then authorizes and releases the harness; additional pre-start setup belongs before that release. A read-only launch confirmation prevents Bubblewrap's EOF-unblock behavior from executing the harness on setup failure. Setup is bounded to ten seconds, and missing/failed helpers never fall back to host networking. The launcher supervises both processes, preserves harness stdin and exit status, and stops the sandbox if its network helper exits.
 
 Networking helpers live only for their launch; named shared networks are not supported. Strict public-internet-only `outbound` networking remains a [future enhancement](ENHANCEMENTS.md#strict-outbound-networking).
+
+### Published ports
+
+Expose a room's TCP service on a fixed host localhost port:
+
+```sh
+runroom --network private --publish 23001:3000
+runroom --network private --publish 23001:3000 --publish 23002:8080
+```
+
+The format is `HOST_PORT:ROOM_PORT`, with both ports in `1..=65535`. Publishing requires the Bubblewrap runtime and `network = "private"`; `host` and `none` are rejected. Host listeners bind only to IPv4 `127.0.0.1`, not LAN interfaces. The service inside the room must listen on `0.0.0.0` or its `tap0` address (`10.0.2.100`), not only room-local `127.0.0.1`. For the first example, browse `http://localhost:23001`.
+
+Profile or base defaults keep the inline table syntax:
+
+```toml
+[launcher.profiles.omp]
+network = "private"
+port_forwards = [
+  { host_port = 23001, room_port = 3000 },
+]
+```
+
+Precedence is base, then profile, then CLI, keyed by room port. A CLI mapping replaces the existing mapping for that room port or adds a new one. Repeating a room port in the same layer is an error; effective host ports must also be unique. An occupied or unavailable host port fails startup before the harness runs, without selecting another port. If any mapping fails, earlier registrations and the helper are cleaned up.
+
+Mappings remain active only for that room's lifetime and are removed when its helper exits. They survive Herdr routing and conversation resume through explicit replay arguments. Saved mappings override matching current defaults; newly added current defaults still apply and trigger the configuration mismatch guard. Effective mappings participate in the fingerprint and appear in its editable recovery command. Existing rooms are not modified.
 
 ## Herdr activity and conversation resume
 

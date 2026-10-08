@@ -135,6 +135,9 @@ fn editable_launch_command(args: &LauncherArgs) -> Result<String, Box<dyn Error>
     if let Some(profile) = &args.profile {
         option("--profile", profile.as_str().into());
     }
+    if let Some(directory) = &args.workspace_directory {
+        option("--workspace-directory", directory.as_str().into());
+    }
     if let Some(network) = args.network {
         let network = match network {
             crate::config::NetworkFileMode::Host => "host",
@@ -142,6 +145,12 @@ fn editable_launch_command(args: &LauncherArgs) -> Result<String, Box<dyn Error>
             crate::config::NetworkFileMode::Private => "private",
         };
         option("--network", network.into());
+    }
+    for forward in &args.publish {
+        option(
+            "--publish",
+            format!("{}:{}", forward.host_port, forward.room_port).into(),
+        );
     }
     if let Some(cores) = &args.cpu_cores {
         option(
@@ -304,11 +313,17 @@ mod tests {
             "/tmp/control 'quoted'.sock",
             "--profile",
             "custom profile",
+            "--workspace-directory",
+            "original project",
             "--name",
             "workspace 'name'",
             "--here",
             "--network",
-            "none",
+            "private",
+            "--publish",
+            "23001:3000",
+            "--publish",
+            "23002:8080",
             "--cpu-cores",
             "1,3",
             "--read-only",
@@ -335,10 +350,12 @@ mod tests {
         assert_eq!(normal.command.as_deref(), Some(harness));
         assert_eq!(normal.socket, args.socket);
         assert_eq!(normal.profile, args.profile);
+        assert_eq!(normal.workspace_directory, args.workspace_directory);
         assert_eq!(normal.name, args.name);
         assert_eq!(normal.mounts, args.mounts);
         assert_eq!(normal.read_only, args.read_only);
         assert_eq!(normal.network, args.network);
+        assert_eq!(normal.publish, args.publish);
         assert_eq!(normal.cpu_cores, args.cpu_cores);
         assert!(normal.here && normal.verbose);
         assert!(normal.resume.is_none() && normal.continuation_token.is_none());
@@ -394,7 +411,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let settings = effective.resolve(std::path::Path::new("/")).unwrap();
+        let settings = effective.resolve(std::path::Path::new("/"), None).unwrap();
         let replay = crate::canonical_replay_arguments(&settings, &current).unwrap();
         let parsed = Cli::try_parse_from(
             std::iter::once("runroom").chain(replay.iter().map(String::as_str)),

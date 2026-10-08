@@ -4,6 +4,8 @@ use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
+use serde::Deserialize;
+
 use super::{HerdrContext, InstanceId, ResolvedWorkspace};
 
 /// User intent sent by the launcher.
@@ -138,11 +140,20 @@ pub struct EnvironmentVariable {
     pub value: OsString,
 }
 
+/// One TCP service explicitly published on the host's IPv4 loopback interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortForward {
+    pub host_port: u16,
+    pub room_port: u16,
+}
+
 /// Fully parsed outer-runtime policy selected for one launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePolicy {
     pub kind: RuntimeKind,
     pub network: NetworkMode,
+    pub port_forwards: Vec<PortForward>,
     pub bind_mounts: Vec<BindMount>,
     pub devices: Vec<DeviceMount>,
     pub environment: Vec<EnvironmentVariable>,

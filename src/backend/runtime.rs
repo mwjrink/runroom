@@ -45,6 +45,7 @@ impl RuntimeBackend for NativeRuntimeBackend {
                 actual: launch.runtime.kind,
             });
         }
+        validate_port_forwards(launch)?;
         if launch.runtime.network == NetworkMode::Private {
             return Err(RuntimeError::PrivateNetworkRequiresBubblewrap);
         }
@@ -126,6 +127,7 @@ impl BubblewrapRuntimeBackend {
                 actual: launch.runtime.kind,
             });
         }
+        validate_port_forwards(launch)?;
         Self::validate_data_files(data_files)?;
         Self::validate_private_network(launch, resolver_descriptor)?;
         let home = launch
@@ -701,6 +703,29 @@ fn push_path_pair(arguments: &mut Vec<OsString>, option: &str, value: &Path) {
     arguments.push(value.as_os_str().to_owned());
 }
 
+fn validate_port_forwards(launch: &LaunchSpec) -> Result<(), RuntimeError> {
+    let forwards = &launch.runtime.port_forwards;
+    if forwards.is_empty() {
+        return Ok(());
+    }
+    if launch.runtime.kind != RuntimeKind::Bubblewrap
+        || launch.runtime.network != NetworkMode::Private
+    {
+        return Err(RuntimeError::PortForwardsRequirePrivateBubblewrap);
+    }
+    let mut host_ports = HashSet::with_capacity(forwards.len());
+    let mut room_ports = HashSet::with_capacity(forwards.len());
+    for forward in forwards {
+        if forward.host_port == 0 || forward.room_port == 0 {
+            return Err(RuntimeError::InvalidPortForward);
+        }
+        if !host_ports.insert(forward.host_port) || !room_ports.insert(forward.room_port) {
+            return Err(RuntimeError::DuplicateForwardPort);
+        }
+    }
+    Ok(())
+}
+
 /// Runtime policy or command-compilation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeError {
@@ -727,6 +752,9 @@ pub enum RuntimeError {
     DuplicateDestination(PathBuf),
     NativeDevicesUnsupported,
     PrivateNetworkRequiresBubblewrap,
+    PortForwardsRequirePrivateBubblewrap,
+    InvalidPortForward,
+    DuplicateForwardPort,
     MissingPrivateResolver,
     PrivateResolverRequiresPrivateNetwork,
     PrivateTunUnavailable(String),
@@ -744,6 +772,11 @@ pub enum RuntimeError {
 impl Display for RuntimeError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PortForwardsRequirePrivateBubblewrap => formatter.write_str(
+                "port forwarding requires the Bubblewrap runtime and network = \"private\"",
+            ),
+            Self::InvalidPortForward => formatter.write_str("forwarded ports must be nonzero"),
+            Self::DuplicateForwardPort => formatter.write_str("host/room ports must be unique"),
             Self::PrivateNetworkRequiresBubblewrap => {
                 formatter.write_str("network = \"private\" requires the Bubblewrap runtime")
             }
@@ -869,6 +902,7 @@ mod tests {
             runtime: RuntimePolicy {
                 kind,
                 network,
+                port_forwards: Vec::new(),
                 bind_mounts: vec![
                     BindMount {
                         source: BindMountSource::Workspace,
@@ -1171,6 +1205,78 @@ mod tests {
             NativeRuntimeBackend.prepare(&launch),
             Err(RuntimeError::PrivateNetworkRequiresBubblewrap),
         );
+    }
+
+    #[test]
+    fn published_ports_require_private_bubblewrap_at_runtime_boundary() {
+        for (kind, network) in [
+            (RuntimeKind::Native, NetworkMode::Host),
+            (RuntimeKind::Native, NetworkMode::Private),
+            (RuntimeKind::Bubblewrap, NetworkMode::Host),
+            (RuntimeKind::Bubblewrap, NetworkMode::None),
+        ] {
+            let mut launch = launch(kind, network);
+            launch
+                .runtime
+                .port_forwards
+                .push(crate::model::PortForward {
+                    host_port: 23001,
+                    room_port: 3000,
+                });
+            let result = match kind {
+                RuntimeKind::Native => NativeRuntimeBackend.prepare(&launch),
+                RuntimeKind::Bubblewrap => BubblewrapRuntimeBackend.prepare(&launch),
+            };
+            assert_eq!(
+                result,
+                Err(RuntimeError::PortForwardsRequirePrivateBubblewrap)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_rejects_zero_and_duplicate_forward_ports() {
+        use crate::model::PortForward;
+        let mut launch = launch(RuntimeKind::Bubblewrap, NetworkMode::Private);
+        let valid = PortForward {
+            host_port: 23001,
+            room_port: 3000,
+        };
+        launch.runtime.port_forwards = vec![valid];
+        assert_eq!(validate_port_forwards(&launch), Ok(()));
+        for invalid in [
+            PortForward {
+                host_port: 0,
+                ..valid
+            },
+            PortForward {
+                room_port: 0,
+                ..valid
+            },
+        ] {
+            launch.runtime.port_forwards = vec![invalid];
+            assert_eq!(
+                validate_port_forwards(&launch),
+                Err(RuntimeError::InvalidPortForward)
+            );
+        }
+        for duplicate in [
+            valid,
+            PortForward {
+                room_port: 3001,
+                ..valid
+            },
+            PortForward {
+                host_port: 23002,
+                ..valid
+            },
+        ] {
+            launch.runtime.port_forwards = vec![valid, duplicate];
+            assert_eq!(
+                validate_port_forwards(&launch),
+                Err(RuntimeError::DuplicateForwardPort)
+            );
+        }
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub use instance::{
 };
 pub use launch::{
     BindAccess, BindMount, BindMountSource, DeviceMount, EnvironmentVariable, ForegroundCommand,
-    LaunchHandoff, LaunchRequest, LaunchSpec, LauncherContinuation, NetworkMode,
+    LaunchHandoff, LaunchRequest, LaunchSpec, LauncherContinuation, NetworkMode, PortForward,
     PrepareLaunchRequest, PreparedExec, PreparedLaunch, ResourceLimits, RuntimeDataFile,
     RuntimeKind, RuntimePolicy,
 };

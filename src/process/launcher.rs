@@ -528,7 +528,7 @@ fn continuation_arguments(token: &str, continuation: LauncherContinuation) -> Ve
 
 fn execute_runtime(launch: &LaunchSpec, prepared: &crate::model::PreparedExec) -> io::Result<()> {
     if launch.runtime.network == NetworkMode::Private {
-        let status = super::network::run(prepared, &launch.command)?;
+        let status = super::network::run(prepared, &launch.command, &launch.runtime.port_forwards)?;
         std::process::exit(
             status
                 .code()
@@ -785,7 +785,7 @@ struct DescriptorWorkspace<'a> {
     host_path: &'a Path,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<&'a str>,
-    path: &'static str,
+    path: &'a Path,
     #[serde(skip_serializing_if = "Option::is_none")]
     change_name: Option<&'a str>,
     origin: &'static str,
@@ -874,6 +874,20 @@ fn create_launch_descriptor(
 ) -> io::Result<File> {
     let workspace_id = descriptor_herdr_value("HERDR_WORKSPACE_ID", herdr.workspace_id.as_deref())?;
     let pane_id = descriptor_herdr_value("HERDR_PANE_ID", herdr.pane_id.as_deref())?;
+    let workspace_path = config
+        .runtime
+        .bind_mounts
+        .iter()
+        .find_map(|mount| {
+            matches!(mount.source, BindMountSource::Workspace)
+                .then_some(mount.destination.as_path())
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launch identity descriptor requires a workspace bind mount",
+            )
+        })?;
     let (kind, name) = match &launch.workspace.selection {
         WorkspaceSelection::Primary => ("primary", None),
         WorkspaceSelection::Named(name) => ("named", Some(name.0.as_str())),
@@ -894,7 +908,7 @@ fn create_launch_descriptor(
             kind,
             name,
             host_path: &launch.workspace.path,
-            path: "/workspace",
+            path: workspace_path,
             change_name: launch.workspace.change_name.as_deref(),
             origin,
         },
@@ -992,6 +1006,72 @@ mod tests {
     }
 
     #[test]
+    fn launch_descriptor_uses_selected_workspace_bind_destination() {
+        let mut launch = PreparedLaunch {
+            instance_id: crate::model::InstanceId("instance".to_owned()),
+            workspace: crate::model::ResolvedWorkspace {
+                project: crate::model::ProjectId("project".to_owned()),
+                primary_checkout: PathBuf::from("/host/project"),
+                selection: WorkspaceSelection::Primary,
+                path: PathBuf::from("/managed/generated-worktree"),
+                change_name: None,
+                origin: WorkspaceOrigin::Primary,
+                support_mounts: Vec::new(),
+            },
+        };
+        let mut config = LauncherConfig::new(
+            "/control.sock",
+            "coding".to_owned(),
+            "pi".to_owned(),
+            ForegroundCommand {
+                executable: "pi".into(),
+                arguments: Vec::new(),
+            },
+            reporting_runtime(),
+        );
+        let herdr = HerdrContext {
+            workspace_id: Some("workspace".to_owned()),
+            pane_id: Some("pane".to_owned()),
+            session_name: None,
+        };
+        for (selection, origin, destination) in [
+            (
+                WorkspaceSelection::Primary,
+                WorkspaceOrigin::Primary,
+                "/src",
+            ),
+            (
+                WorkspaceSelection::Named(WorkspaceName("review".to_owned())),
+                WorkspaceOrigin::Created,
+                "/custom/project",
+            ),
+            (
+                WorkspaceSelection::Here,
+                WorkspaceOrigin::Directory,
+                "/-src",
+            ),
+        ] {
+            launch.workspace.selection = selection;
+            launch.workspace.origin = origin;
+            config.runtime.bind_mounts = vec![crate::model::BindMount {
+                source: BindMountSource::Workspace,
+                destination: PathBuf::from(destination),
+                access: BindAccess::ReadWrite,
+            }];
+            let descriptor = create_launch_descriptor(&launch, &config, &herdr, None).unwrap();
+            let descriptor: serde_json::Value = serde_json::from_reader(descriptor).unwrap();
+            assert_eq!(descriptor["workspace"]["path"], destination);
+            assert_eq!(
+                descriptor["workspace"]["host_path"],
+                "/managed/generated-worktree"
+            );
+        }
+        config.runtime.bind_mounts.clear();
+        let error = create_launch_descriptor(&launch, &config, &herdr, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn live_continuation_retains_overrides_but_restores_original_workspace_routing() {
         let continuation = LauncherContinuation {
             socket_path: "/unused.sock".into(),
@@ -1007,6 +1087,8 @@ mod tests {
                 "custom",
                 "--herdr-agent",
                 "stale:pi",
+                "--workspace-directory",
+                "-original",
                 "--network",
                 "private",
                 "--here",
@@ -1029,6 +1111,8 @@ mod tests {
                 "/control.sock",
                 "--profile",
                 "custom",
+                "--workspace-directory",
+                "-original",
                 "--network",
                 "private",
                 "--cpu-count",
@@ -1084,6 +1168,7 @@ mod tests {
         let mut runtime = RuntimePolicy {
             kind: RuntimeKind::Bubblewrap,
             network: crate::model::NetworkMode::Host,
+            port_forwards: Vec::new(),
             bind_mounts: Vec::new(),
             devices: Vec::new(),
             environment: vec![
@@ -1132,6 +1217,7 @@ mod tests {
         RuntimePolicy {
             kind: RuntimeKind::Bubblewrap,
             network: crate::model::NetworkMode::None,
+            port_forwards: Vec::new(),
             bind_mounts: Vec::new(),
             devices: Vec::new(),
             environment: Vec::new(),
